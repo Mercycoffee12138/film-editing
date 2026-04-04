@@ -37,10 +37,10 @@ class AudioConfig:
     top_highlights: int = 20
     peak_threshold_quantile: float = 0.8
     beat_min_distance_seconds: float = 0.3
-    beat_top_candidates: int = 220
+    beat_top_candidates: int = 280
     beat_threshold_quantile: float = 0.66
     beat_sparse_threshold_quantile: float = 0.8
-    beat_sparse_distance_scale: float = 1.65
+    beat_sparse_distance_scale: float = 1.35
 
 
 @dataclass(frozen=True)
@@ -78,8 +78,8 @@ class MatchConfig:
     min_clip_seconds: float = 0.5
     max_clip_seconds: float = 3.0
     beat_cut_enabled: bool = True
-    beat_cut_min_clip_seconds: float = 0.18
-    beat_cut_max_clip_seconds: float = 1.25
+    beat_cut_min_clip_seconds: float = 0.14
+    beat_cut_max_clip_seconds: float = 1.05
     source_reuse_penalty: float = 0.25
 
 

@@ -12,7 +12,7 @@ from .qwen_vision import QwenVisionContentBlockedError, analyze_images, load_con
 from .stage_02_review_fight_segments import (
     _clamp_timestamp,
     _export_collision_event_previews,
-    _extract_refined_collision_candidates,
+    _extract_audio_candidates,
     _segment_anchor_times,
 )
 
@@ -31,12 +31,16 @@ def _collision_review_prompt(segment_duration: float, anchor_count: int, candida
 
     return (
         "你在做打斗片段的碰撞点精确识别。"
-        "这个片段已经确认是打斗，现在要从候选点里挑出真正适合卡点的瞬间。"
+        "这个片段已经确认是打斗，现在要从音频先找到的候选点里挑出真正适合卡点的瞬间。"
         "所有图片都按顺序输入。"
         f"前 {anchor_count} 张是整段打斗片段的锚点抽帧。"
         "后续每 3 张为一个候选点的 前一瞬间 / 当前瞬间 / 后一瞬间。"
-        "只选择真正发生了接触的瞬间，例如拳脚命中、武器碰撞、爆炸真正爆开的瞬间。"
-        "不要选择蓄力、挥空、镜头晃动、纯闪光、运镜切换。"
+        "请判断这些候选点对应的画面，是否真的属于以下任一情况："
+        "1. 人物正在用手脚打斗并且发生了有效击中或接触；"
+        "2. 武器之间或武器与人体/物体发生了明确碰撞；"
+        "3. 正在运用功法、招式、法术、气劲，并且这一瞬间是明显的释放、命中、对撞或爆开时刻。"
+        "只选择真正发生动作接触或功法爆发的瞬间。"
+        "不要选择蓄力、起手、挥空、普通运镜、镜头晃动、纯闪光、切镜头。"
         "请只返回 JSON，不要输出 markdown 代码块，不要补充解释。"
         'JSON 格式必须是: {"primary_candidate_index": 0, "selected_candidate_indices": [1, 3], "summary": "..."}。'
         "primary_candidate_index 是最精准、最值得卡点的那个候选编号，没有就填 0。"
@@ -140,7 +144,9 @@ def _resolve_ai_collision_times(
 
 def _enrich_segment_with_collision_events(config: PipelineConfig, segment: dict) -> dict:
     payload = dict(segment)
-    collision_events = _extract_refined_collision_candidates(config, payload)
+    # Candidate discovery is intentionally audio-first; the vision model only verifies
+    # whether each audio hit aligns with a true fight impact / weapon clash / skill burst.
+    collision_events = _extract_audio_candidates(config, payload)
     review = dict(payload.get("review") or {})
     review["collision_events"] = collision_events
     review["collision_ai_summary"] = ""
