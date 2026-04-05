@@ -76,7 +76,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "002.mp3"
+    selected_music_filename: str | None = "003.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 42.0
     max_highlights_per_track: int = 16
@@ -91,6 +91,7 @@ class MatchConfig:
     minimum_sequence_match_count: int = 2
     preferred_sequence_match_count: int = 3
     single_point_match_penalty: float = 0.18
+    beat_boundary_threshold_quantile: float = 0.75
 
 
 @dataclass(frozen=True)

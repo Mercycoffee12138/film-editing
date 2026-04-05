@@ -203,9 +203,26 @@ def _merge_sync_targets(
     beat_points: list[dict],
     config: MatchConfig,
 ) -> list[float]:
+    beat_scores = [float(item.get("score", 0.0)) for item in beat_points]
+    beat_threshold = 0.0
+    if beat_scores:
+        ordered_scores = sorted(beat_scores)
+        quantile_index = min(
+            len(ordered_scores) - 1,
+            max(0, int(round((len(ordered_scores) - 1) * config.beat_boundary_threshold_quantile))),
+        )
+        beat_threshold = ordered_scores[quantile_index]
+
     raw_targets = sorted(
         round(float(item["time"]), 3)
-        for item in [*selected_highlights, *beat_points]
+        for item in [
+            *selected_highlights,
+            *[
+                beat
+                for beat in beat_points
+                if float(beat.get("score", 0.0)) >= beat_threshold
+            ],
+        ]
     )
     if not raw_targets:
         return []
@@ -219,6 +236,18 @@ def _merge_sync_targets(
         merged.append([target_time])
 
     return [round(group[-1], 3) for group in merged]
+
+
+def _all_sync_targets(
+    selected_highlights: list[dict],
+    beat_points: list[dict],
+) -> list[float]:
+    return sorted(
+        {
+            round(float(item["time"]), 3)
+            for item in [*selected_highlights, *beat_points]
+        }
+    )
 
 
 def _build_sync_timeline_chunks(
@@ -410,6 +439,25 @@ def _merge_sequence_chunks(
     return merged
 
 
+def _assign_chunk_sync_target_times(
+    timeline: list[dict],
+    sync_targets: list[float],
+) -> list[dict]:
+    enriched: list[dict] = []
+    for chunk in timeline:
+        start = round(float(chunk["start"]), 3)
+        end = round(float(chunk["end"]), 3)
+        chunk_targets = [
+            round(float(target_time), 3)
+            for target_time in sync_targets
+            if start - 1e-3 <= float(target_time) <= end + 1e-3
+        ]
+        payload = dict(chunk)
+        payload["sync_target_times"] = chunk_targets
+        enriched.append(payload)
+    return enriched
+
+
 def _segment_event_times(segment: dict) -> list[float]:
     event_times = sorted(
         round(float(value), 3)
@@ -475,7 +523,7 @@ def _sequence_alignment_plan(
     chunk: dict,
     target_times: list[float],
     config: MatchConfig,
-) -> tuple[float, float, float, float | None, float, int, float | None]:
+) -> tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]]:
     clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
         segment,
         duration,
@@ -492,6 +540,8 @@ def _sequence_alignment_plan(
             alignment_error,
             1 if target_highlight_time is not None else 0,
             None,
+            [round(float(source_event_time), 3)] if target_highlight_time is not None else [],
+            [round(float(target_highlight_time), 3)] if target_highlight_time is not None else [],
         )
 
     max_start = max(float(segment["video_duration"]) - duration, 0.0)
@@ -571,9 +621,11 @@ def _sequence_alignment_plan(
             alignment_error,
             1 if target_highlight_time is not None else 0,
             None,
+            [round(float(source_event_time), 3)] if target_highlight_time is not None else [],
+            [round(float(target_highlight_time), 3)] if target_highlight_time is not None else [],
         )
 
-    matched_event_count, average_error, interval_error, best_clip_start, _, _ = best_sequence
+    matched_event_count, average_error, interval_error, best_clip_start, matched_event_times, matched_target_times = best_sequence
     best_clip_end = best_clip_start + duration
     return (
         round(best_clip_start, 3),
@@ -583,6 +635,8 @@ def _sequence_alignment_plan(
         round(average_error, 3),
         matched_event_count,
         round(interval_error, 3) if interval_error is not None else None,
+        [round(float(value), 3) for value in matched_event_times],
+        [round(float(value), 3) for value in matched_target_times],
     )
 
 
@@ -735,6 +789,7 @@ def build_timeline_chunks(
 ) -> list[dict]:
     if config.beat_cut_enabled and beat_points:
         sync_targets = _merge_sync_targets(selected_highlights, beat_points, config)
+        all_sync_targets = _all_sync_targets(selected_highlights, beat_points)
         beat_timeline = _build_sync_timeline_chunks(
             audio_start,
             audio_end,
@@ -751,13 +806,14 @@ def build_timeline_chunks(
                 selected_highlights,
                 config,
             )
-            return _enforce_minimum_chunk_duration(
+            beat_timeline = _enforce_minimum_chunk_duration(
                 beat_timeline,
                 audio_start,
                 audio_end,
                 selected_highlights,
                 config,
             )
+            return _assign_chunk_sync_target_times(beat_timeline, all_sync_targets)
 
     cut_points = [audio_start] + [highlight["time"] for highlight in selected_highlights] + [audio_end]
     raw_gaps = [end - start for start, end in zip(cut_points, cut_points[1:])]
@@ -936,6 +992,8 @@ def assign_clips(
                 alignment_error,
                 matched_event_count,
                 sequence_interval_error,
+                _,
+                _,
             ) = _sequence_alignment_plan(
                 segment,
                 duration,
@@ -988,6 +1046,8 @@ def assign_clips(
             alignment_error,
             matched_event_count,
             sequence_interval_error,
+            matched_source_event_times,
+            matched_target_times,
         ) = _sequence_alignment_plan(
             selected_segment,
             duration,
@@ -1010,6 +1070,8 @@ def assign_clips(
                 alignment_error=alignment_error,
                 matched_event_count=matched_event_count,
                 sequence_interval_error=sequence_interval_error,
+                matched_source_event_times=matched_source_event_times,
+                matched_target_times=matched_target_times,
             )
         )
 

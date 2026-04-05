@@ -61,6 +61,8 @@ class MatchedClipRecord:
     alignment_error: float | None = None
     matched_event_count: int = 1
     sequence_interval_error: float | None = None
+    matched_source_event_times: list[float] = field(default_factory=list)
+    matched_target_times: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

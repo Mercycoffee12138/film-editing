@@ -73,40 +73,47 @@ def _clip_hit_audio_segments(clips: list[dict], config: PipelineConfig) -> list[
     segments: list[dict] = []
     timeline_cursor = 0.0
     for clip in clips:
-        source_event_time = clip.get("source_event_time")
-        if source_event_time is None:
+        source_event_times = [
+            float(value)
+            for value in (clip.get("matched_source_event_times") or [])
+            if isinstance(value, (int, float))
+        ]
+        if not source_event_times and clip.get("source_event_time") is not None:
+            source_event_times = [float(clip["source_event_time"])]
+
+        if not source_event_times:
             timeline_cursor += float(clip["duration"])
             continue
 
         clip_start = float(clip["clip_start"])
         clip_end = float(clip["clip_end"])
         clip_duration = max(clip_end - clip_start, 0.0)
-        event_time = float(source_event_time)
-        local_start = max(clip_start, event_time - config.render.source_hit_pre_seconds)
-        local_end = min(clip_end, event_time + config.render.source_hit_post_seconds)
-
-        duration = max(local_end - local_start, 0.0)
         minimum_duration = min(config.render.source_hit_min_segment_seconds, clip_duration)
-        if 0.0 < duration < minimum_duration:
-            center = min(max(event_time, clip_start + (minimum_duration * 0.5)), clip_end - (minimum_duration * 0.5))
-            local_start = max(clip_start, center - (minimum_duration * 0.5))
-            local_end = min(clip_end, local_start + minimum_duration)
-            local_start = max(clip_start, local_end - minimum_duration)
+
+        for event_time in sorted(set(source_event_times)):
+            local_start = max(clip_start, event_time - config.render.source_hit_pre_seconds)
+            local_end = min(clip_end, event_time + config.render.source_hit_post_seconds)
+
             duration = max(local_end - local_start, 0.0)
+            if 0.0 < duration < minimum_duration:
+                center = min(max(event_time, clip_start + (minimum_duration * 0.5)), clip_end - (minimum_duration * 0.5))
+                local_start = max(clip_start, center - (minimum_duration * 0.5))
+                local_end = min(clip_end, local_start + minimum_duration)
+                local_start = max(clip_start, local_end - minimum_duration)
+                duration = max(local_end - local_start, 0.0)
 
-        if duration <= 0.01:
-            timeline_cursor += float(clip["duration"])
-            continue
+            if duration <= 0.01:
+                continue
 
-        timeline_offset = timeline_cursor + max(local_start - clip_start, 0.0)
-        segments.append(
-            {
-                "trimmed_path": clip["trimmed_path"],
-                "source_start": round(local_start, 3),
-                "duration": round(duration, 3),
-                "timeline_offset": round(timeline_offset, 3),
-            }
-        )
+            timeline_offset = timeline_cursor + max(local_start - clip_start, 0.0)
+            segments.append(
+                {
+                    "trimmed_path": clip["trimmed_path"],
+                    "source_start": round(local_start, 3),
+                    "duration": round(duration, 3),
+                    "timeline_offset": round(timeline_offset, 3),
+                }
+            )
         timeline_cursor += float(clip["duration"])
 
     return segments
