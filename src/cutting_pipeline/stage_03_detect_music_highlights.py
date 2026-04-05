@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
 
 from .audio_features import (
     frame_metric as _frame_metric,
@@ -47,7 +46,7 @@ def _records_from_indices(
     return records
 
 
-def _music_review_prompt(candidate_payload: list[dict[str, Any]]) -> str:
+def _music_review_prompt(candidate_payload: list[dict[str, Any]], config: PipelineConfig) -> str:
     candidate_lines = "\n".join(
         (
             f"{item['candidate_index']}. {item['time']:.3f}s, "
@@ -56,6 +55,13 @@ def _music_review_prompt(candidate_payload: list[dict[str, Any]]) -> str:
         for item in candidate_payload
     ) or "无候选点。"
 
+    dense_rhythm_instruction = ""
+    if config.audio.beat_ai_dense_rhythm_bias:
+        dense_rhythm_instruction = (
+            "如果某几个候选点能组成短促、连续、重复的节奏切点，请尽量保留到 rhythmic_group。"
+            "整体风格可以明显更密一点，宁可多保留可剪辑的连续鼓点，也不要轻易漏掉。"
+        )
+
     return (
         "你在做音乐剪辑卡点识别。"
         "第 1 张图是整首音乐的概览图，上半部分是波形，下半部分是频谱。"
@@ -63,9 +69,9 @@ def _music_review_prompt(candidate_payload: list[dict[str, Any]]) -> str:
         "你的任务是把候选点分成两类："
         "1. single_impact：突然出现的单个重音、爆点、强击打点；"
         "2. rhythmic_group：处在一组重复重音、连续鼓点、连续节奏推进里的点。"
-        "如果某几个候选点能组成短促、连续、重复的节奏切点，请尽量保留到 rhythmic_group。"
         "如果某个候选点不明显、不稳定、或者不适合做卡点，就不要选。"
-        "优先选择清晰、干净、适合剪辑切点的候选。整体风格可以稍微更密一点。"
+        "优先选择清晰、干净、适合剪辑切点的候选。"
+        f"{dense_rhythm_instruction}"
         "请只返回 JSON，不要输出 markdown 代码块，不要补充解释。"
         'JSON 格式必须是: {"single_impact_indices":[1,2], "rhythmic_group_indices":[3,4], "summary":"..."}。'
         "\n候选点列表:\n"
@@ -132,6 +138,11 @@ def _export_audio_image(path: Path, start: float, duration: float, output_path: 
 
 
 def _stack_audio_review_image(wave_path: Path, spectrum_path: Path, output_path: Path) -> None:
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Pillow is required for AI music review image generation. Install it with `pip install Pillow`.") from exc
+
     wave = Image.open(wave_path).convert("RGB")
     spectrum = Image.open(spectrum_path).convert("RGB")
     width = max(wave.width, spectrum.width)
@@ -235,7 +246,7 @@ def _apply_ai_music_review(
     )
     response = analyze_images(
         image_paths,
-        _music_review_prompt(candidate_payload),
+        _music_review_prompt(candidate_payload, config),
         vision_config,
     )
     review = _parse_music_review_json(response["text"])
@@ -347,13 +358,17 @@ def _select_rhythmic_group_indices(
     seconds_per_frame: float,
     config: PipelineConfig,
 ) -> list[int]:
-    if len(beat_indices) < 3:
+    minimum_group_size = max(2, config.audio.beat_group_min_size)
+    if len(beat_indices) < minimum_group_size:
         return []
 
-    min_gap_seconds = max(config.audio.beat_min_distance_seconds * 0.75, 0.18)
-    max_gap_seconds = 1.1
-    max_gap_delta_seconds = 0.2
-    min_group_size = 2
+    min_gap_seconds = max(
+        config.audio.beat_min_distance_seconds * 0.75,
+        config.audio.beat_group_min_gap_seconds,
+    )
+    max_gap_seconds = config.audio.beat_group_max_gap_seconds
+    max_gap_delta_seconds = config.audio.beat_group_max_gap_delta_seconds
+    min_group_size = minimum_group_size
     groups: list[list[int]] = []
     current_group = [beat_indices[0]]
 
@@ -435,7 +450,13 @@ def _analyze_track(path: Path, config: PipelineConfig) -> MusicTrackRecord:
         accent,
     )
 
-    beat_scores = _moving_average(((normalized_accent * 0.82) + (normalized_energy * 0.18)).astype(np.float32), 3)
+    beat_scores = _moving_average(
+        (
+            (normalized_accent * config.audio.beat_score_accent_weight)
+            + (normalized_energy * config.audio.beat_score_energy_weight)
+        ).astype(np.float32),
+        3,
+    )
     beat_threshold = max(
         float(np.quantile(beat_scores, config.audio.beat_threshold_quantile)),
         float(beat_scores.mean() + beat_scores.std() * 0.12),

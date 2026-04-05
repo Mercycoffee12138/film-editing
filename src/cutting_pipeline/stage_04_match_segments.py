@@ -156,22 +156,26 @@ def _make_chunk(
     audio_start: float,
     audio_end: float,
     selected_highlights: list[dict],
+    sync_target_time: float | None = None,
+    sync_target_position: str | None = None,
+    disable_implicit_sync: bool = False,
 ) -> dict:
     center_time = (start + end) / 2.0
-    sync_target_time = None
-    sync_target_position = None
-    for highlight in selected_highlights:
-        highlight_time = float(highlight["time"])
-        if abs(end - highlight_time) <= 1e-3 and end < audio_end - 1e-3:
-            sync_target_time = round(end, 3)
-            sync_target_position = "end"
-            break
-    if sync_target_time is None:
+    resolved_sync_target_time = sync_target_time
+    resolved_sync_target_position = sync_target_position
+    if resolved_sync_target_time is None and not disable_implicit_sync:
+        for highlight in selected_highlights:
+            highlight_time = float(highlight["time"])
+            if abs(end - highlight_time) <= 1e-3 and end < audio_end - 1e-3:
+                resolved_sync_target_time = round(end, 3)
+                resolved_sync_target_position = "end"
+                break
+    if resolved_sync_target_time is None and not disable_implicit_sync:
         for highlight in selected_highlights:
             highlight_time = float(highlight["time"])
             if abs(start - highlight_time) <= 1e-3 and start > audio_start + 1e-3:
-                sync_target_time = round(start, 3)
-                sync_target_position = "start"
+                resolved_sync_target_time = round(start, 3)
+                resolved_sync_target_position = "start"
                 break
 
     return {
@@ -182,30 +186,53 @@ def _make_chunk(
             _target_intensity(center_time, audio_start, audio_end, selected_highlights),
             4,
         ),
-        "sync_target_time": sync_target_time,
-        "sync_target_position": sync_target_position,
+        "sync_target_time": resolved_sync_target_time,
+        "sync_target_position": resolved_sync_target_position,
     }
 
 
-def _build_beat_timeline_chunks(
-    audio_start: float,
-    audio_end: float,
+def _merge_sync_targets(
     selected_highlights: list[dict],
     beat_points: list[dict],
     config: MatchConfig,
-) -> list[dict]:
-    filtered_beats = sorted(
-        {
-            round(float(beat["time"]), 3): beat
-            for beat in beat_points
-            if audio_start < float(beat["time"]) < audio_end
-        }.values(),
-        key=lambda item: float(item["time"]),
+) -> list[float]:
+    raw_targets = sorted(
+        round(float(item["time"]), 3)
+        for item in [*selected_highlights, *beat_points]
     )
-    if not filtered_beats:
+    if not raw_targets:
         return []
 
-    cut_points = [audio_start] + [float(beat["time"]) for beat in filtered_beats] + [audio_end]
+    merge_threshold = max(config.beat_cut_min_clip_seconds, 0.12)
+    merged: list[list[float]] = [[raw_targets[0]]]
+    for target_time in raw_targets[1:]:
+        if abs(target_time - merged[-1][-1]) <= merge_threshold:
+            merged[-1].append(target_time)
+            continue
+        merged.append([target_time])
+
+    return [round(group[-1], 3) for group in merged]
+
+
+def _build_sync_timeline_chunks(
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    sync_targets: list[float],
+    beat_points: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    filtered_targets = sorted(
+        {
+            round(float(target_time), 3)
+            for target_time in sync_targets
+            if audio_start < float(target_time) < audio_end
+        }
+    )
+    if not filtered_targets:
+        return []
+
+    cut_points = [audio_start] + filtered_targets + [audio_end]
     timeline: list[dict] = []
     min_duration = config.beat_cut_min_clip_seconds
     max_duration = config.beat_cut_max_clip_seconds
@@ -217,18 +244,59 @@ def _build_beat_timeline_chunks(
         if proposed_duration < min_duration and timeline:
             timeline[-1]["end"] = round(proposed_end, 3)
             timeline[-1]["duration"] = round(float(timeline[-1]["end"]) - float(timeline[-1]["start"]), 3)
+            if proposed_end < audio_end - 1e-3:
+                timeline[-1]["sync_target_time"] = round(proposed_end, 3)
+                timeline[-1]["sync_target_position"] = "end"
             chunk_start = proposed_end
             continue
 
         while proposed_duration > max_duration:
             split_end = min(chunk_start + max_duration, proposed_end)
-            timeline.append(_make_chunk(chunk_start, split_end, audio_start, audio_end, selected_highlights))
+            is_target_boundary = abs(split_end - proposed_end) <= 1e-3 and proposed_end < audio_end - 1e-3
+            timeline.append(
+                _make_chunk(
+                    chunk_start,
+                    split_end,
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                    sync_target_time=round(proposed_end, 3) if is_target_boundary else None,
+                    sync_target_position="end" if is_target_boundary else None,
+                    disable_implicit_sync=True,
+                )
+            )
             chunk_start = split_end
             proposed_duration = proposed_end - chunk_start
 
         if proposed_duration <= 0.0:
             continue
-        timeline.append(_make_chunk(chunk_start, proposed_end, audio_start, audio_end, selected_highlights))
+        if proposed_end < audio_end - 1e-3:
+            timeline.append(
+                _make_chunk(
+                    chunk_start,
+                    proposed_end,
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                    sync_target_time=round(proposed_end, 3),
+                    sync_target_position="end",
+                    disable_implicit_sync=True,
+                )
+            )
+        else:
+            sync_start = chunk_start if chunk_start > audio_start + 1e-3 else None
+            timeline.append(
+                _make_chunk(
+                    chunk_start,
+                    proposed_end,
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                    sync_target_time=round(sync_start, 3) if sync_start is not None else None,
+                    sync_target_position="start" if sync_start is not None else None,
+                    disable_implicit_sync=True,
+                )
+            )
         chunk_start = proposed_end
 
     return timeline
@@ -372,6 +440,62 @@ def _accelerate_high_intensity_chunks(
     return accelerated
 
 
+def _enforce_minimum_chunk_duration(
+    timeline: list[dict],
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    if not timeline:
+        return []
+
+    minimum_duration = config.beat_cut_min_clip_seconds if config.beat_cut_enabled else config.min_clip_seconds
+    merged: list[dict] = []
+
+    for chunk in timeline:
+        current = dict(chunk)
+        if not merged:
+            merged.append(current)
+            continue
+
+        if float(current["duration"]) < minimum_duration or float(merged[-1]["duration"]) < minimum_duration:
+            previous = merged.pop()
+            merged.append(
+                _make_chunk(
+                    float(previous["start"]),
+                    float(current["end"]),
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                    sync_target_time=current.get("sync_target_time") or previous.get("sync_target_time"),
+                    sync_target_position=current.get("sync_target_position") or previous.get("sync_target_position"),
+                    disable_implicit_sync=True,
+                )
+            )
+            continue
+
+        merged.append(current)
+
+    if len(merged) >= 2 and float(merged[-1]["duration"]) < minimum_duration:
+        last = merged.pop()
+        previous = merged.pop()
+        merged.append(
+            _make_chunk(
+                float(previous["start"]),
+                float(last["end"]),
+                audio_start,
+                audio_end,
+                selected_highlights,
+                sync_target_time=last.get("sync_target_time") or previous.get("sync_target_time"),
+                sync_target_position=last.get("sync_target_position") or previous.get("sync_target_position"),
+                disable_implicit_sync=True,
+            )
+        )
+
+    return merged
+
+
 def build_timeline_chunks(
     audio_start: float,
     audio_end: float,
@@ -380,15 +504,23 @@ def build_timeline_chunks(
     beat_points: list[dict] | None = None,
 ) -> list[dict]:
     if config.beat_cut_enabled and beat_points:
-        beat_timeline = _build_beat_timeline_chunks(
+        sync_targets = _merge_sync_targets(selected_highlights, beat_points, config)
+        beat_timeline = _build_sync_timeline_chunks(
             audio_start,
             audio_end,
             selected_highlights,
+            sync_targets,
             beat_points,
             config,
         )
         if beat_timeline:
-            return beat_timeline
+            return _enforce_minimum_chunk_duration(
+                beat_timeline,
+                audio_start,
+                audio_end,
+                selected_highlights,
+                config,
+            )
 
     cut_points = [audio_start] + [highlight["time"] for highlight in selected_highlights] + [audio_end]
     raw_gaps = [end - start for start, end in zip(cut_points, cut_points[1:])]
@@ -437,7 +569,14 @@ def build_timeline_chunks(
         selected_highlights,
         config,
     )
-    return _accelerate_high_intensity_chunks(
+    timeline = _accelerate_high_intensity_chunks(
+        timeline,
+        audio_start,
+        audio_end,
+        selected_highlights,
+        config,
+    )
+    return _enforce_minimum_chunk_duration(
         timeline,
         audio_start,
         audio_end,

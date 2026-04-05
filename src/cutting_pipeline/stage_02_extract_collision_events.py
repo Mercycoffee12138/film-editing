@@ -39,11 +39,13 @@ def _collision_review_prompt(segment_duration: float, anchor_count: int, candida
         "1. 人物正在用手脚打斗并且发生了有效击中或接触；"
         "2. 武器之间或武器与人体/物体发生了明确碰撞；"
         "3. 正在运用功法、招式、法术、气劲，并且这一瞬间是明显的释放、命中、对撞或爆开时刻。"
+        "如果同一段里出现连续连击、连招交换、连续兵器碰撞、连续爆点，允许并且应该保留多个真实接触瞬间。"
         "只选择真正发生动作接触或功法爆发的瞬间。"
         "不要选择蓄力、起手、挥空、普通运镜、镜头晃动、纯闪光、切镜头。"
         "请只返回 JSON，不要输出 markdown 代码块，不要补充解释。"
         'JSON 格式必须是: {"primary_candidate_index": 0, "selected_candidate_indices": [1, 3], "summary": "..."}。'
         "primary_candidate_index 是最精准、最值得卡点的那个候选编号，没有就填 0。"
+        "selected_candidate_indices 可以返回多个，尤其在连续动作里不要只保留一个。"
         f"当前片段时长约 {segment_duration:.2f} 秒。"
         "\n候选点列表:\n"
         f"{candidate_lines}"

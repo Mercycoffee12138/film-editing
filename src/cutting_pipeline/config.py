@@ -36,11 +36,18 @@ class AudioConfig:
     min_peak_distance_seconds: float = 2.2
     top_highlights: int = 20
     peak_threshold_quantile: float = 0.8
-    beat_min_distance_seconds: float = 0.3
-    beat_top_candidates: int = 280
-    beat_threshold_quantile: float = 0.66
-    beat_sparse_threshold_quantile: float = 0.8
-    beat_sparse_distance_scale: float = 1.35
+    beat_min_distance_seconds: float = 0.22
+    beat_top_candidates: int = 360
+    beat_threshold_quantile: float = 0.6
+    beat_sparse_threshold_quantile: float = 0.84
+    beat_sparse_distance_scale: float = 1.15
+    beat_score_accent_weight: float = 0.86
+    beat_score_energy_weight: float = 0.14
+    beat_group_min_gap_seconds: float = 0.14
+    beat_group_max_gap_seconds: float = 1.2
+    beat_group_max_gap_delta_seconds: float = 0.28
+    beat_group_min_size: int = 2
+    beat_ai_dense_rhythm_bias: bool = True
 
 
 @dataclass(frozen=True)
@@ -51,17 +58,17 @@ class FightAIConfig:
     coarse_min_confidence: float = 0.42
     coarse_merge_gap_seconds: float = 1.4
     fine_anchor_frames: int = 5
-    fine_event_context_seconds: float = 0.12
-    fine_max_event_candidates: int = 6
-    audio_candidate_min_spacing_seconds: float = 0.22
+    fine_event_context_seconds: float = 0.18
+    fine_max_event_candidates: int = 10
+    audio_candidate_min_spacing_seconds: float = 0.12
     audio_candidate_peak_quantile: float = 0.86
-    max_key_events_per_segment: int = 6
+    max_key_events_per_segment: int = 10
     refined_audio_candidate_min_spacing_seconds: float = 0.12
     refined_audio_candidate_peak_quantile: float = 0.74
     refined_max_event_candidates: int = 8
     refined_visual_analysis_fps: int = 12
     refined_visual_candidate_min_spacing_seconds: float = 0.12
-    collision_repeat_score_ratio: float = 0.82
+    collision_repeat_score_ratio: float = 0.6
     collision_preview_lead_seconds: float = 0.35
     collision_preview_tail_seconds: float = 0.35
     collision_preview_min_duration_seconds: float = 0.5
@@ -101,11 +108,13 @@ class RenderConfig:
     video_preset: str = "veryfast"
     audio_bitrate: str = "192k"
     include_source_hit_audio: bool = True
-    music_volume: float = 1.0
-    source_hit_volume: float = 2.2
-    source_hit_pre_seconds: float = 0.12
-    source_hit_post_seconds: float = 0.22
-    source_hit_fade_seconds: float = 0.03
+    music_volume: float = 0.95
+    source_hit_volume: float = 9
+    source_hit_pre_seconds: float = 0.04
+    source_hit_post_seconds: float = 0.1
+    source_hit_fade_seconds: float = 0.02
+    source_hit_min_segment_seconds: float = 0.12
+    source_hit_full_clip_threshold_seconds: float = 0.0
 
 
 @dataclass(frozen=True)

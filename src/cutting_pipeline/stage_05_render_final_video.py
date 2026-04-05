@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import PipelineConfig
-from .ffmpeg_tools import run_command
+from .ffmpeg_tools import concat_video_clips, run_command
 from .progress import StageReporter
 
 
@@ -70,9 +70,6 @@ def _render_audio_excerpt(config: PipelineConfig, music_path: str, start: float,
 
 
 def _clip_hit_audio_segments(clips: list[dict], config: PipelineConfig) -> list[dict]:
-    if not config.render.include_source_hit_audio:
-        return []
-
     segments: list[dict] = []
     timeline_cursor = 0.0
     for clip in clips:
@@ -83,10 +80,20 @@ def _clip_hit_audio_segments(clips: list[dict], config: PipelineConfig) -> list[
 
         clip_start = float(clip["clip_start"])
         clip_end = float(clip["clip_end"])
+        clip_duration = max(clip_end - clip_start, 0.0)
         event_time = float(source_event_time)
         local_start = max(clip_start, event_time - config.render.source_hit_pre_seconds)
         local_end = min(clip_end, event_time + config.render.source_hit_post_seconds)
+
         duration = max(local_end - local_start, 0.0)
+        minimum_duration = min(config.render.source_hit_min_segment_seconds, clip_duration)
+        if 0.0 < duration < minimum_duration:
+            center = min(max(event_time, clip_start + (minimum_duration * 0.5)), clip_end - (minimum_duration * 0.5))
+            local_start = max(clip_start, center - (minimum_duration * 0.5))
+            local_end = min(clip_end, local_start + minimum_duration)
+            local_start = max(clip_start, local_end - minimum_duration)
+            duration = max(local_end - local_start, 0.0)
+
         if duration <= 0.01:
             timeline_cursor += float(clip["duration"])
             continue
@@ -240,31 +247,12 @@ def run(config: PipelineConfig, reporter: StageReporter, match_payload: dict) ->
     )
 
     concat_list_path = config.paths.stage_05_temp_dir / "stage_05_concat_list.txt"
-    concat_lines = [f"file '{path.resolve()}'" for path in rendered_clip_paths]
-    concat_list_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
-
     concat_video_path = config.paths.stage_05_temp_dir / "stage_05_concat_video.mp4"
     reporter.update(
         (len(clips) + 1) / max(len(clips) + 2, 1),
         "Concatenating rendered clips.",
     )
-    concat_command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_list_path),
-        "-c",
-        "copy",
-        str(concat_video_path),
-    ]
-    run_command(concat_command)
+    concat_video_clips(rendered_clip_paths, concat_video_path, concat_list_path)
 
     final_output_path = config.paths.build_dir / "stage_05_final_video.mp4"
     reporter.update(
