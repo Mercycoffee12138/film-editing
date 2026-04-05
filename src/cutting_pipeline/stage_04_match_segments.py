@@ -158,6 +158,7 @@ def _make_chunk(
     selected_highlights: list[dict],
     sync_target_time: float | None = None,
     sync_target_position: str | None = None,
+    sync_target_times: list[float] | None = None,
     disable_implicit_sync: bool = False,
 ) -> dict:
     center_time = (start + end) / 2.0
@@ -188,6 +189,12 @@ def _make_chunk(
         ),
         "sync_target_time": resolved_sync_target_time,
         "sync_target_position": resolved_sync_target_position,
+        "sync_target_times": sorted(
+            {
+                round(float(value), 3)
+                for value in ((sync_target_times or []) + ([resolved_sync_target_time] if resolved_sync_target_time is not None else []))
+            }
+        ),
     }
 
 
@@ -247,6 +254,12 @@ def _build_sync_timeline_chunks(
             if proposed_end < audio_end - 1e-3:
                 timeline[-1]["sync_target_time"] = round(proposed_end, 3)
                 timeline[-1]["sync_target_position"] = "end"
+                timeline[-1]["sync_target_times"] = sorted(
+                    {
+                        *list(timeline[-1].get("sync_target_times") or []),
+                        round(proposed_end, 3),
+                    }
+                )
             chunk_start = proposed_end
             continue
 
@@ -262,6 +275,7 @@ def _build_sync_timeline_chunks(
                     selected_highlights,
                     sync_target_time=round(proposed_end, 3) if is_target_boundary else None,
                     sync_target_position="end" if is_target_boundary else None,
+                    sync_target_times=[round(proposed_end, 3)] if is_target_boundary else [],
                     disable_implicit_sync=True,
                 )
             )
@@ -280,6 +294,7 @@ def _build_sync_timeline_chunks(
                     selected_highlights,
                     sync_target_time=round(proposed_end, 3),
                     sync_target_position="end",
+                    sync_target_times=[round(proposed_end, 3)],
                     disable_implicit_sync=True,
                 )
             )
@@ -294,12 +309,105 @@ def _build_sync_timeline_chunks(
                     selected_highlights,
                     sync_target_time=round(sync_start, 3) if sync_start is not None else None,
                     sync_target_position="start" if sync_start is not None else None,
+                    sync_target_times=[round(sync_start, 3)] if sync_start is not None else [],
                     disable_implicit_sync=True,
                 )
             )
         chunk_start = proposed_end
 
     return timeline
+
+
+def _merge_sequence_chunks(
+    timeline: list[dict],
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    if not timeline:
+        return []
+
+    merged: list[dict] = []
+    index = 0
+    while index < len(timeline):
+        current = dict(timeline[index])
+        current_targets = sorted(round(float(value), 3) for value in (current.get("sync_target_times") or []))
+
+        best_chunk = current
+        best_target_count = len(current_targets)
+        probe_index = index + 1
+        while probe_index < len(timeline):
+            candidate = timeline[probe_index]
+            combined_start = float(current["start"])
+            combined_end = float(candidate["end"])
+            combined_duration = combined_end - combined_start
+            if combined_duration > config.max_clip_seconds + 1e-6:
+                break
+
+            combined_targets = sorted(
+                {
+                    *current_targets,
+                    *(round(float(value), 3) for value in (candidate.get("sync_target_times") or [])),
+                }
+            )
+            if len(combined_targets) <= best_target_count:
+                break
+
+            current = _make_chunk(
+                combined_start,
+                combined_end,
+                audio_start,
+                audio_end,
+                selected_highlights,
+                sync_target_time=combined_targets[-1] if combined_targets else None,
+                sync_target_position="end" if combined_targets else None,
+                sync_target_times=combined_targets,
+                disable_implicit_sync=True,
+            )
+            current_targets = combined_targets
+            best_chunk = current
+            best_target_count = len(combined_targets)
+
+            if best_target_count >= config.preferred_sequence_match_count:
+                probe_index += 1
+                while probe_index < len(timeline):
+                    extra = timeline[probe_index]
+                    extra_targets = sorted(
+                        {
+                            *current_targets,
+                            *(round(float(value), 3) for value in (extra.get("sync_target_times") or [])),
+                        }
+                    )
+                    extra_duration = float(extra["end"]) - float(best_chunk["start"])
+                    if extra_duration > config.max_clip_seconds + 1e-6 or len(extra_targets) == len(current_targets):
+                        break
+                    current = _make_chunk(
+                        float(best_chunk["start"]),
+                        float(extra["end"]),
+                        audio_start,
+                        audio_end,
+                        selected_highlights,
+                        sync_target_time=extra_targets[-1] if extra_targets else None,
+                        sync_target_position="end" if extra_targets else None,
+                        sync_target_times=extra_targets,
+                        disable_implicit_sync=True,
+                    )
+                    current_targets = extra_targets
+                    best_chunk = current
+                    best_target_count = len(extra_targets)
+                    probe_index += 1
+                break
+
+            probe_index += 1
+
+        merged.append(best_chunk)
+        consumed_until = probe_index if best_chunk is not timeline[index] and float(best_chunk["end"]) != float(timeline[index]["end"]) else index + 1
+        while consumed_until < len(timeline) and float(timeline[consumed_until - 1]["end"]) < float(best_chunk["end"]) - 1e-6:
+            consumed_until += 1
+        index = max(consumed_until, index + 1)
+
+    return merged
 
 
 def _segment_event_times(segment: dict) -> list[float]:
@@ -353,6 +461,128 @@ def _alignment_plan(
         round(best_source_event_time, 3),
         round(float(sync_target_time), 3) if sync_target_time is not None else None,
         round(best_error, 3),
+    )
+
+
+def _chunk_target_times(timeline_chunks: list[dict], chunk_index: int) -> list[float]:
+    chunk = timeline_chunks[chunk_index]
+    return sorted(round(float(value), 3) for value in (chunk.get("sync_target_times") or []))
+
+
+def _sequence_alignment_plan(
+    segment: dict,
+    duration: float,
+    chunk: dict,
+    target_times: list[float],
+    config: MatchConfig,
+) -> tuple[float, float, float, float | None, float, int, float | None]:
+    clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
+        segment,
+        duration,
+        chunk,
+    )
+    event_times = _segment_event_times(segment)
+    minimum_match_count = max(2, config.minimum_sequence_match_count)
+    if len(target_times) < minimum_match_count or len(event_times) < minimum_match_count:
+        return (
+            clip_start,
+            clip_end,
+            source_event_time,
+            target_highlight_time,
+            alignment_error,
+            1 if target_highlight_time is not None else 0,
+            None,
+        )
+
+    max_start = max(float(segment["video_duration"]) - duration, 0.0)
+    chunk_start = float(chunk["start"])
+    sync_target_time = round(float(chunk["sync_target_time"]), 3) if chunk.get("sync_target_time") is not None else None
+    target_positions = [round(float(target_time) - chunk_start, 3) for target_time in target_times]
+
+    best_sequence: tuple[int, float, float, float, list[float], list[float]] | None = None
+    best_reference_target: float | None = None
+    best_reference_event: float | None = None
+
+    max_match_count = min(len(target_positions), len(event_times))
+    for match_count in range(max_match_count, minimum_match_count - 1, -1):
+        for target_index in range(0, len(target_positions) - match_count + 1):
+            target_window = target_positions[target_index : target_index + match_count]
+            target_window_times = target_times[target_index : target_index + match_count]
+            for event_index in range(0, len(event_times) - match_count + 1):
+                event_window = event_times[event_index : event_index + match_count]
+                unclamped_start = sum(
+                    source_time - target_position
+                    for source_time, target_position in zip(event_window, target_window)
+                ) / match_count
+                candidate_start = max(0.0, min(unclamped_start, max_start))
+                position_errors = [
+                    abs((source_time - candidate_start) - target_position)
+                    for source_time, target_position in zip(event_window, target_window)
+                ]
+                average_error = sum(position_errors) / match_count
+
+                interval_error: float | None = None
+                if match_count >= 2:
+                    interval_ratios: list[float] = []
+                    for source_left, source_right, target_left, target_right in zip(
+                        event_window,
+                        event_window[1:],
+                        target_window,
+                        target_window[1:],
+                    ):
+                        target_gap = max(target_right - target_left, 1e-3)
+                        source_gap = source_right - source_left
+                        interval_ratios.append(abs(source_gap - target_gap) / target_gap)
+                    interval_error = sum(interval_ratios) / len(interval_ratios) if interval_ratios else 0.0
+                effective_interval_error = interval_error if interval_error is not None else 1.0
+                candidate_key = (
+                    match_count,
+                    -average_error,
+                    -effective_interval_error,
+                    -abs(unclamped_start - candidate_start),
+                )
+                if best_sequence is None or candidate_key > (
+                    best_sequence[0],
+                    -best_sequence[1],
+                    -best_sequence[2],
+                    -best_sequence[3],
+                ):
+                    best_sequence = (
+                        match_count,
+                        average_error,
+                        effective_interval_error,
+                        candidate_start,
+                        event_window,
+                        target_window_times,
+                    )
+                    if sync_target_time in target_window_times:
+                        reference_index = target_window_times.index(sync_target_time)
+                    else:
+                        reference_index = len(target_window_times) - 1
+                    best_reference_target = target_window_times[reference_index]
+                    best_reference_event = event_window[reference_index]
+
+    if best_sequence is None or best_reference_event is None:
+        return (
+            clip_start,
+            clip_end,
+            source_event_time,
+            target_highlight_time,
+            alignment_error,
+            1 if target_highlight_time is not None else 0,
+            None,
+        )
+
+    matched_event_count, average_error, interval_error, best_clip_start, _, _ = best_sequence
+    best_clip_end = best_clip_start + duration
+    return (
+        round(best_clip_start, 3),
+        round(best_clip_end, 3),
+        round(best_reference_event, 3),
+        round(float(best_reference_target), 3) if best_reference_target is not None else None,
+        round(average_error, 3),
+        matched_event_count,
+        round(interval_error, 3) if interval_error is not None else None,
     )
 
 
@@ -514,6 +744,13 @@ def build_timeline_chunks(
             config,
         )
         if beat_timeline:
+            beat_timeline = _merge_sequence_chunks(
+                beat_timeline,
+                audio_start,
+                audio_end,
+                selected_highlights,
+                config,
+            )
             return _enforce_minimum_chunk_duration(
                 beat_timeline,
                 audio_start,
@@ -619,8 +856,10 @@ def assign_clips(
     clips: list[MatchedClipRecord] = []
 
     for order, chunk in enumerate(timeline_chunks, start=1):
+        chunk_index = order - 1
         duration = float(chunk["duration"])
         target_intensity = float(chunk["target_intensity"])
+        chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
         if target_intensity <= 0.36 and ranked_calm_segments:
             candidate_pool_name = "calm"
         elif (target_intensity >= 0.52 and ranked_fight_segments) or not ranked_calm_segments:
@@ -689,20 +928,46 @@ def assign_clips(
                 pool_bias = 0.08 if target_intensity <= 0.36 else 0.0
 
             intensity_match = 1.0 - abs(normalized_segment_level - desired_level)
-            _, _, _, _, alignment_error = _alignment_plan(segment, duration, chunk)
+            (
+                _,
+                _,
+                _,
+                _,
+                alignment_error,
+                matched_event_count,
+                sequence_interval_error,
+            ) = _sequence_alignment_plan(
+                segment,
+                duration,
+                chunk,
+                chunk_target_times,
+                config,
+            )
             alignment_score = 1.0 - min(alignment_error / max(duration, 1e-6), 1.0)
             has_key_events = bool(segment.get("key_event_times"))
             event_bonus = 0.05 if has_key_events else 0.0
             if has_key_events and chunk.get("sync_target_time") is not None:
                 event_bonus += 0.08
+            sequence_bonus = 0.0
+            if matched_event_count >= config.minimum_sequence_match_count:
+                sequence_bonus += 0.14
+                sequence_bonus += 0.06 * max(
+                    0,
+                    matched_event_count - config.minimum_sequence_match_count,
+                )
+                if sequence_interval_error is not None:
+                    sequence_bonus += 0.10 * (1.0 - min(sequence_interval_error, 1.0))
+            elif len(chunk_target_times) >= config.minimum_sequence_match_count:
+                sequence_bonus -= config.single_point_match_penalty
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
             weighted_score = (
-                (intensity_match * 0.38)
+                (intensity_match * 0.34)
                 + (normalized_segment_score * segment_score_weight)
                 + (normalized_fight_probability * fight_probability_weight)
-                + (alignment_score * 0.28)
+                + (alignment_score * 0.22)
                 + pool_bias
                 + event_bonus
+                + sequence_bonus
             ) / reuse_penalty
             if weighted_score > best_score:
                 best_score = weighted_score
@@ -715,10 +980,20 @@ def assign_clips(
             selected_segment = remaining_calm_segments.pop(best_index)
         reuse_count[selected_segment["source_path"]] += 1
 
-        clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
+        (
+            clip_start,
+            clip_end,
+            source_event_time,
+            target_highlight_time,
+            alignment_error,
+            matched_event_count,
+            sequence_interval_error,
+        ) = _sequence_alignment_plan(
             selected_segment,
             duration,
             chunk,
+            chunk_target_times,
+            config,
         )
 
         clips.append(
@@ -733,6 +1008,8 @@ def assign_clips(
                 source_event_time=source_event_time,
                 target_highlight_time=target_highlight_time,
                 alignment_error=alignment_error,
+                matched_event_count=matched_event_count,
+                sequence_interval_error=sequence_interval_error,
             )
         )
 

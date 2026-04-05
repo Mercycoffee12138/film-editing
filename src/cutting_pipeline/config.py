@@ -88,6 +88,9 @@ class MatchConfig:
     beat_cut_min_clip_seconds: float = 0.14
     beat_cut_max_clip_seconds: float = 1.05
     source_reuse_penalty: float = 0.25
+    minimum_sequence_match_count: int = 2
+    preferred_sequence_match_count: int = 3
+    single_point_match_penalty: float = 0.18
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,7 @@ class RenderConfig:
     audio_bitrate: str = "192k"
     include_source_hit_audio: bool = True
     music_volume: float = 0.95
-    source_hit_volume: float = 9
+    source_hit_volume: float = 13
     source_hit_pre_seconds: float = 0.04
     source_hit_post_seconds: float = 0.1
     source_hit_fade_seconds: float = 0.02

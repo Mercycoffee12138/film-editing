@@ -59,6 +59,8 @@ class MatchedClipRecord:
     source_event_time: float | None = None
     target_highlight_time: float | None = None
     alignment_error: float | None = None
+    matched_event_count: int = 1
+    sequence_interval_error: float | None = None
 
 
 @dataclass(frozen=True)
