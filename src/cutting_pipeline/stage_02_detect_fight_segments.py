@@ -93,7 +93,7 @@ def _build_stage_payload(
         "status": status,
         "detection_mode": detection_mode,
         "videos": videos_payload,
-        "top_segments": [asdict(segment) for segment in sorted_segments[:100]],
+        "top_segments": [asdict(segment) for segment in sorted_segments],
         "calm_segments": [asdict(segment) for segment in sorted_calm_segments[:150]],
         "segment_count": len(sorted_segments),
         "calm_segment_count": len(sorted_calm_segments),

@@ -23,22 +23,20 @@ STAGE_SEQUENCE = (
     "stage_04_match_segments",
     "stage_05_render_final_video",
 )
-
-
-def _artifact_path(project_root: Path, stage_name: str) -> Path:
+def _artifact_path(build_dir: Path, stage_name: str) -> Path:
     artifact_map = {
-        "stage_01_trim_videos": project_root / "build" / "stage_01_trim_manifest.json",
-        "stage_02_detect_fight_segments": project_root / "build" / "stage_02_fight_segments.json",
-        "stage_02_review_fight_segments": project_root / "build" / "stage_02_reviewed_fight_segments.json",
-        "stage_02_extract_collision_events": project_root / "build" / "stage_02_collision_events.json",
-        "stage_03_detect_music_highlights": project_root / "build" / "stage_03_music_highlights.json",
-        "stage_04_match_segments": project_root / "build" / "stage_04_match_plan.json",
+        "stage_01_trim_videos": build_dir / "stage_01_trim_manifest.json",
+        "stage_02_detect_fight_segments": build_dir / "stage_02_fight_segments.json",
+        "stage_02_review_fight_segments": build_dir / "stage_02_reviewed_fight_segments.json",
+        "stage_02_extract_collision_events": build_dir / "stage_02_collision_events.json",
+        "stage_03_detect_music_highlights": build_dir / "stage_03_music_highlights.json",
+        "stage_04_match_segments": build_dir / "stage_04_match_plan.json",
     }
     return artifact_map[stage_name]
 
 
-def _load_required_artifact(project_root: Path, stage_name: str) -> dict:
-    path = _artifact_path(project_root, stage_name)
+def _load_required_artifact(build_dir: Path, stage_name: str) -> dict:
+    path = _artifact_path(build_dir, stage_name)
     if not path.exists():
         raise FileNotFoundError(
             f"Cannot start from a later stage because required artifact is missing: {path}"
@@ -46,8 +44,17 @@ def _load_required_artifact(project_root: Path, stage_name: str) -> dict:
     return read_json(path)
 
 
-def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") -> None:
-    config = build_default_config(project_root)
+def run_pipeline(
+    project_root: Path,
+    start_stage: str = "stage_01_trim_videos",
+    selected_video_filenames: tuple[str, ...] | None = None,
+    analysis_label: str | None = None,
+) -> None:
+    config = build_default_config(
+        project_root,
+        selected_video_filenames=selected_video_filenames,
+        analysis_label=analysis_label,
+    )
     config.paths.build_dir.mkdir(parents=True, exist_ok=True)
 
     if start_stage not in STAGE_SEQUENCE:
@@ -62,7 +69,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             reporter.stage("stage_01_trim_videos"),
         )
     else:
-        trim_manifest = _load_required_artifact(project_root, "stage_01_trim_videos")
+        trim_manifest = _load_required_artifact(config.paths.build_dir, "stage_01_trim_videos")
 
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_02_detect_fight_segments"):
         fight_segments = stage_02_detect_fight_segments.run(
@@ -71,7 +78,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             trim_manifest,
         )
     else:
-        fight_segments = _load_required_artifact(project_root, "stage_02_detect_fight_segments")
+        fight_segments = _load_required_artifact(config.paths.build_dir, "stage_02_detect_fight_segments")
 
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_02_review_fight_segments"):
         reviewed_fight_segments = stage_02_review_fight_segments.run(
@@ -80,7 +87,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             fight_segments,
         )
     else:
-        reviewed_fight_segments = _load_required_artifact(project_root, "stage_02_review_fight_segments")
+        reviewed_fight_segments = _load_required_artifact(config.paths.build_dir, "stage_02_review_fight_segments")
 
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_02_extract_collision_events"):
         collision_event_segments = stage_02_extract_collision_events.run(
@@ -89,7 +96,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             reviewed_fight_segments,
         )
     else:
-        collision_event_segments = _load_required_artifact(project_root, "stage_02_extract_collision_events")
+        collision_event_segments = _load_required_artifact(config.paths.build_dir, "stage_02_extract_collision_events")
 
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_03_detect_music_highlights"):
         music_highlights = stage_03_detect_music_highlights.run(
@@ -97,7 +104,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             reporter.stage("stage_03_detect_music_highlights"),
         )
     else:
-        music_highlights = _load_required_artifact(project_root, "stage_03_detect_music_highlights")
+        music_highlights = _load_required_artifact(config.paths.build_dir, "stage_03_detect_music_highlights")
 
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_04_match_segments"):
         match_payload = stage_04_match_segments.run(
@@ -107,7 +114,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
             music_highlights,
         )
     else:
-        match_payload = _load_required_artifact(project_root, "stage_04_match_segments")
+        match_payload = _load_required_artifact(config.paths.build_dir, "stage_04_match_segments")
 
     stage_05_render_final_video.run(
         config,

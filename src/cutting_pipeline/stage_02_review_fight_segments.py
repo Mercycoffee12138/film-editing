@@ -96,6 +96,29 @@ def _extract_audio_candidates(config: PipelineConfig, segment: dict) -> list[dic
     )
 
 
+def _fft_bandpass_signal(
+    samples: np.ndarray,
+    sample_rate: int,
+    low_hz: float,
+    high_hz: float,
+) -> np.ndarray:
+    if samples.size == 0:
+        return samples
+
+    low = max(float(low_hz), 0.0)
+    high = min(float(high_hz), sample_rate * 0.5)
+    if high <= low:
+        return np.zeros_like(samples, dtype=np.float32)
+
+    spectrum = np.fft.rfft(samples.astype(np.float32))
+    frequencies = np.fft.rfftfreq(samples.size, d=1.0 / float(sample_rate))
+    mask = (frequencies >= low) & (frequencies <= high)
+    filtered = np.zeros_like(spectrum)
+    filtered[mask] = spectrum[mask]
+    restored = np.fft.irfft(filtered, n=samples.size)
+    return restored.astype(np.float32)
+
+
 def _extract_audio_candidates_with_params(
     config: PipelineConfig,
     segment: dict,
@@ -118,10 +141,24 @@ def _extract_audio_candidates_with_params(
     except RuntimeError:
         return []
 
-    accent_samples = np.diff(samples, prepend=samples[0])
-    energy = frame_metric(samples, config.audio.frame_length, config.audio.hop_length)
+    impact_samples = _fft_bandpass_signal(
+        samples,
+        sample_rate=config.audio.sample_rate,
+        low_hz=config.fight_ai.audio_candidate_impact_band_min_hz,
+        high_hz=config.fight_ai.audio_candidate_impact_band_max_hz,
+    )
+    speech_samples = _fft_bandpass_signal(
+        samples,
+        sample_rate=config.audio.sample_rate,
+        low_hz=80.0,
+        high_hz=config.fight_ai.audio_candidate_speech_band_max_hz,
+    )
+
+    accent_samples = np.diff(impact_samples, prepend=impact_samples[0])
+    energy = frame_metric(impact_samples, config.audio.frame_length, config.audio.hop_length)
     accent = frame_metric(accent_samples, config.audio.frame_length, config.audio.hop_length)
-    if energy.size == 0 or accent.size == 0:
+    speech_energy = frame_metric(speech_samples, config.audio.frame_length, config.audio.hop_length)
+    if energy.size == 0 or accent.size == 0 or speech_energy.size == 0:
         return []
 
     energy_focus = np.maximum(
@@ -135,8 +172,30 @@ def _extract_audio_candidates_with_params(
 
     normalized_energy = normalize_robust(energy_focus).astype(np.float32)
     normalized_accent = normalize_robust(accent_focus).astype(np.float32)
-    combined = moving_average(((normalized_accent * 0.72) + (normalized_energy * 0.28)).astype(np.float32), 3)
-    support_scores = moving_average(normalized_accent.astype(np.float32), 3)
+    speech_penalty = np.maximum(
+        normalize_robust(
+            moving_average(
+                speech_energy.astype(np.float32),
+                max(3, int(round(config.audio.sample_rate * 0.18 / config.audio.hop_length))),
+            )
+        ).astype(np.float32),
+        0.0,
+    )
+    combined = moving_average(
+        (
+            (normalized_accent * 0.74)
+            + (normalized_energy * 0.26)
+            - (speech_penalty * config.fight_ai.audio_candidate_speech_penalty_weight)
+        ).astype(np.float32),
+        3,
+    )
+    support_scores = moving_average(
+        (
+            normalized_accent
+            - (speech_penalty * max(config.fight_ai.audio_candidate_speech_penalty_weight * 0.45, 0.0))
+        ).astype(np.float32),
+        3,
+    )
 
     threshold = max(
         float(np.quantile(combined, peak_quantile)),
@@ -183,6 +242,7 @@ def _extract_audio_candidates_with_params(
                 "score": round(float(combined[peak_index]), 6),
                 "audio_energy": round(float(energy[peak_index]), 6),
                 "audio_accent": round(float(accent[peak_index]), 6),
+                "speech_score": round(float(speech_energy[peak_index]), 6),
                 "candidate_source": "audio",
             }
         )
@@ -311,6 +371,7 @@ def _merge_collision_candidates(
                 existing["visual_score"] = max(_best_value(existing, "visual_score"), _best_value(candidate, "score") if candidate.get("candidate_source") == "visual" else _best_value(existing, "visual_score"))
                 existing["audio_energy"] = max(_best_value(existing, "audio_energy"), _best_value(candidate, "audio_energy"))
                 existing["audio_accent"] = max(_best_value(existing, "audio_accent"), _best_value(candidate, "audio_accent"))
+                existing["speech_score"] = max(_best_value(existing, "speech_score"), _best_value(candidate, "speech_score"))
                 existing["visual_motion"] = max(_best_value(existing, "visual_motion"), _best_value(candidate, "visual_motion"))
                 existing["visual_flash"] = max(_best_value(existing, "visual_flash"), _best_value(candidate, "visual_flash"))
                 audio_component = _best_value(existing, "audio_score")
@@ -335,6 +396,7 @@ def _merge_collision_candidates(
                 "visual_score": round(visual_component, 6),
                 "audio_energy": round(float(candidate.get("audio_energy", 0.0)), 6),
                 "audio_accent": round(float(candidate.get("audio_accent", 0.0)), 6),
+                "speech_score": round(float(candidate.get("speech_score", 0.0)), 6),
                 "visual_motion": round(float(candidate.get("visual_motion", 0.0)), 6),
                 "visual_flash": round(float(candidate.get("visual_flash", 0.0)), 6),
                 "candidate_source": str(candidate.get("candidate_source", "audio")),
@@ -671,7 +733,7 @@ def _apply_relaxed_acceptance(reviewed_segments: list[dict[str, Any]], config: P
 
 
 def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload: dict) -> dict:
-    candidates = list(fight_segments_payload.get("top_segments") or [])[: config.review.max_candidate_segments]
+    candidates = list(fight_segments_payload.get("top_segments") or [])
     reporter.start(f"Refining {len(candidates)} candidate fight segments with Qwen VL.")
 
     vision_config = load_config_from_env() if config.review.enabled else None

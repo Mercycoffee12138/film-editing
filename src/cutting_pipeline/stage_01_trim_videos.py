@@ -18,10 +18,21 @@ def run(config: PipelineConfig, reporter: StageReporter) -> dict:
     paths = config.paths
     paths.stage_01_trim_dir.mkdir(parents=True, exist_ok=True)
 
-    source_videos = sorted(paths.video_source_dir.glob("*.mp4"))
+    if config.source.selected_video_filenames:
+        source_videos = [paths.video_source_dir / name for name in config.source.selected_video_filenames]
+        missing = [path.name for path in source_videos if not path.exists()]
+        if missing:
+            available = ", ".join(sorted(path.name for path in paths.video_source_dir.glob("*.mp4")))
+            raise FileNotFoundError(
+                f"Configured video file(s) not found: {', '.join(missing)}. Available videos: {available}"
+            )
+    else:
+        source_videos = sorted(paths.video_source_dir.glob("*.mp4"))
     trimmed_records: list[TrimmedVideoRecord] = []
 
-    reporter.start(f"Preparing to trim {len(source_videos)} videos.")
+    reporter.start(
+        f"Preparing to trim {len(source_videos)} videos for analysis set '{config.source.analysis_label}'."
+    )
 
     for index, source_path in enumerate(source_videos, start=1):
         progress = (index - 1) / max(len(source_videos), 1)
@@ -71,6 +82,8 @@ def run(config: PipelineConfig, reporter: StageReporter) -> dict:
 
     manifest = {
         "stage": "stage_01_trim_videos",
+        "analysis_label": config.source.analysis_label,
+        "selected_video_filenames": list(config.source.selected_video_filenames or []),
         "trimmed_videos": [asdict(record) for record in trimmed_records],
     }
     manifest_path = paths.build_dir / "stage_01_trim_manifest.json"

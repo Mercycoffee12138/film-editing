@@ -502,6 +502,14 @@ def _analyze_track(path: Path, config: PipelineConfig) -> MusicTrackRecord:
 
 def run(config: PipelineConfig, reporter: StageReporter) -> dict:
     music_files = sorted(config.paths.music_source_dir.glob("*"))
+    requested_music = config.match.selected_music_filename
+    if requested_music:
+        music_files = [path for path in music_files if path.name == requested_music]
+        if not music_files:
+            available = ", ".join(sorted(path.name for path in config.paths.music_source_dir.glob("*")))
+            raise ValueError(
+                f"Configured music file '{requested_music}' was not found. Available tracks: {available}"
+            )
     reporter.start(f"Analyzing {len(music_files)} music tracks.")
 
     tracks: list[MusicTrackRecord] = []

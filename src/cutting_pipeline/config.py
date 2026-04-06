@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,10 @@ class FightAIConfig:
     fine_max_event_candidates: int = 10
     audio_candidate_min_spacing_seconds: float = 0.12
     audio_candidate_peak_quantile: float = 0.86
+    audio_candidate_speech_band_max_hz: float = 1600.0
+    audio_candidate_impact_band_min_hz: float = 1800.0
+    audio_candidate_impact_band_max_hz: float = 9000.0
+    audio_candidate_speech_penalty_weight: float = 0.42
     max_key_events_per_segment: int = 10
     refined_audio_candidate_min_spacing_seconds: float = 0.12
     refined_audio_candidate_peak_quantile: float = 0.74
@@ -76,7 +81,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "003.mp3"
+    selected_music_filename: str | None = "004.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 42.0
     max_highlights_per_track: int = 16
@@ -107,18 +112,25 @@ class ReviewConfig:
 class RenderConfig:
     output_width: int = 1920
     output_height: int = 1080
-    output_fps: int = 24
+    output_fps: int = 30
     video_crf: int = 18
     video_preset: str = "veryfast"
     audio_bitrate: str = "192k"
     include_source_hit_audio: bool = True
     music_volume: float = 0.95
-    source_hit_volume: float = 13
-    source_hit_pre_seconds: float = 0.04
-    source_hit_post_seconds: float = 0.1
-    source_hit_fade_seconds: float = 0.02
-    source_hit_min_segment_seconds: float = 0.12
+    source_hit_volume: float = 8
+    source_hit_pre_seconds: float = 0.18
+    source_hit_post_seconds: float = 0.45
+    source_hit_fade_seconds: float = 0.05
+    source_hit_min_segment_seconds: float = 0.36
     source_hit_full_clip_threshold_seconds: float = 0.0
+    source_hit_max_events_per_clip: int = 2
+
+
+@dataclass(frozen=True)
+class SourceConfig:
+    selected_video_filenames: tuple[str, ...] | None = None
+    analysis_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,7 @@ class PipelinePaths:
 @dataclass(frozen=True)
 class PipelineConfig:
     paths: PipelinePaths
+    source: SourceConfig = field(default_factory=SourceConfig)
     trim: TrimConfig = field(default_factory=TrimConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -163,9 +176,35 @@ class PipelineConfig:
     )
 
 
-def build_default_config(project_root: Path) -> PipelineConfig:
+def _sanitize_analysis_label(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    normalized = normalized.strip("._-")
+    return normalized or "default"
+
+
+def _derive_analysis_label(selected_video_filenames: tuple[str, ...] | None) -> str:
+    if not selected_video_filenames:
+        return "all_videos"
+
+    stems = [Path(name).stem for name in selected_video_filenames]
+    if len(stems) == 1:
+        return _sanitize_analysis_label(stems[0])
+    return _sanitize_analysis_label("__".join(stems))
+
+
+def build_default_config(
+    project_root: Path,
+    selected_video_filenames: tuple[str, ...] | None = None,
+    analysis_label: str | None = None,
+) -> PipelineConfig:
     source_root = project_root / "source"
-    build_dir = project_root / "build"
+    source = SourceConfig(
+        selected_video_filenames=selected_video_filenames,
+        analysis_label=_sanitize_analysis_label(analysis_label)
+        if analysis_label
+        else _derive_analysis_label(selected_video_filenames),
+    )
+    build_dir = project_root / "build" / source.analysis_label
 
     paths = PipelinePaths(
         project_root=project_root,
@@ -178,4 +217,4 @@ def build_default_config(project_root: Path) -> PipelineConfig:
         stage_05_clip_dir=build_dir / "stage_05_render_clips",
         stage_05_temp_dir=build_dir / "stage_05_temp",
     )
-    return PipelineConfig(paths=paths)
+    return PipelineConfig(paths=paths, source=source)

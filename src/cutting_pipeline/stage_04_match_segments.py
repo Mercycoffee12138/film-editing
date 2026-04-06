@@ -916,7 +916,9 @@ def assign_clips(
         duration = float(chunk["duration"])
         target_intensity = float(chunk["target_intensity"])
         chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
-        if target_intensity <= 0.36 and ranked_calm_segments:
+        if chunk_target_times and ranked_fight_segments:
+            candidate_pool_name = "fight"
+        elif target_intensity <= 0.36 and ranked_calm_segments:
             candidate_pool_name = "calm"
         elif (target_intensity >= 0.52 and ranked_fight_segments) or not ranked_calm_segments:
             candidate_pool_name = "fight"
