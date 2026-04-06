@@ -517,6 +517,99 @@ def _chunk_target_times(timeline_chunks: list[dict], chunk_index: int) -> list[f
     return sorted(round(float(value), 3) for value in (chunk.get("sync_target_times") or []))
 
 
+def _resolve_chunk_alignment_target(
+    chunk: dict,
+    target_times: list[float],
+) -> dict:
+    if chunk.get("sync_target_time") is not None or not target_times:
+        return chunk
+
+    start = float(chunk["start"])
+    end = float(chunk["end"])
+    center = (start + end) * 0.5
+    resolved_target = min(
+        (round(float(value), 3) for value in target_times),
+        key=lambda value: (
+            min(abs(value - start), abs(end - value)),
+            abs(value - center),
+            -value,
+        ),
+    )
+    resolved_position = "start" if abs(resolved_target - start) <= abs(end - resolved_target) else "end"
+
+    payload = dict(chunk)
+    payload["sync_target_time"] = resolved_target
+    payload["sync_target_position"] = resolved_position
+    return payload
+
+
+def _segment_time_gap(left_segment: dict, right_segment: dict) -> float:
+    if left_segment.get("source_path") != right_segment.get("source_path"):
+        return float("inf")
+
+    left_start = float(left_segment["start"])
+    left_end = float(left_segment["end"])
+    right_start = float(right_segment["start"])
+    right_end = float(right_segment["end"])
+
+    if left_end < right_start:
+        return right_start - left_end
+    if right_end < left_start:
+        return left_start - right_end
+    return 0.0
+
+
+def _continuity_bonus(
+    previous_clip: MatchedClipRecord | None,
+    previous_segment: dict | None,
+    segment: dict,
+    clip_start: float,
+    clip_end: float,
+    requires_event_match: bool,
+) -> float:
+    if previous_clip is None or segment.get("source_path") != previous_clip.source_path:
+        return 0.0
+
+    previous_start = float(previous_clip.clip_start)
+    previous_end = float(previous_clip.clip_end)
+    previous_center = (previous_start + previous_end) * 0.5
+    current_center = (clip_start + clip_end) * 0.5
+
+    center_gap = abs(current_center - previous_center)
+    handoff_gap = abs(clip_start - previous_end)
+    proximity_window = 18.0 if requires_event_match else 26.0
+    handoff_window = 8.0 if requires_event_match else 12.0
+
+    center_score = max(0.0, 1.0 - (center_gap / proximity_window))
+    handoff_score = max(0.0, 1.0 - (handoff_gap / handoff_window))
+
+    segment_proximity_bonus = 0.0
+    if previous_segment is not None:
+        segment_gap = _segment_time_gap(previous_segment, segment)
+        if math.isfinite(segment_gap):
+            segment_proximity_bonus = 0.08 * max(0.0, 1.0 - (segment_gap / 10.0))
+
+    overlap_seconds = max(0.0, min(clip_end, previous_end) - max(clip_start, previous_start))
+    overlap_penalty = 0.0
+    if overlap_seconds > 0.0:
+        overlap_denominator = max(min(float(previous_clip.duration), clip_end - clip_start), 1e-6)
+        overlap_penalty = 0.16 * min(overlap_seconds / overlap_denominator, 1.0)
+
+    backward_penalty = 0.0
+    if clip_start + 0.2 < previous_start:
+        backward_penalty = 0.1 * min((previous_start - clip_start) / 20.0, 1.0)
+
+    continuity_weight = 0.18 if requires_event_match else 0.26
+    return (
+        0.04
+        + (center_score * continuity_weight)
+        + (handoff_score * 0.08)
+        + segment_proximity_bonus
+        - overlap_penalty
+        - backward_penalty
+    )
+
+
 def _sequence_alignment_plan(
     segment: dict,
     duration: float,
@@ -910,12 +1003,15 @@ def assign_clips(
     remaining_calm_segments = list(ranked_calm_segments)
     reuse_count: defaultdict[str, int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
+    previous_segment: dict | None = None
 
     for order, chunk in enumerate(timeline_chunks, start=1):
         chunk_index = order - 1
         duration = float(chunk["duration"])
         target_intensity = float(chunk["target_intensity"])
         chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
+        scoring_chunk = _resolve_chunk_alignment_target(chunk, chunk_target_times)
+        requires_event_match = bool(chunk_target_times) or scoring_chunk.get("sync_target_time") is not None
         if chunk_target_times and ranked_fight_segments:
             candidate_pool_name = "fight"
         elif target_intensity <= 0.36 and ranked_calm_segments:
@@ -955,6 +1051,12 @@ def assign_clips(
         best_pool = candidate_segments[0][0]
         best_index = 0
         best_score = float("-inf")
+        best_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
+        fallback_pool = candidate_segments[0][0]
+        fallback_index = 0
+        fallback_score = float("-inf")
+        fallback_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
+        previous_clip = clips[-1] if clips else None
         for pool_name, index, segment in candidate_segments:
             if pool_name == "fight":
                 normalized_segment_score = (float(segment["score"]) - fight_min) / fight_spread
@@ -986,9 +1088,16 @@ def assign_clips(
                 pool_bias = 0.08 if target_intensity <= 0.36 else 0.0
 
             intensity_match = 1.0 - abs(normalized_segment_level - desired_level)
+            candidate_plan = _sequence_alignment_plan(
+                segment,
+                duration,
+                scoring_chunk,
+                chunk_target_times,
+                config,
+            )
             (
-                _,
-                _,
+                clip_start,
+                clip_end,
                 _,
                 _,
                 alignment_error,
@@ -996,17 +1105,11 @@ def assign_clips(
                 sequence_interval_error,
                 _,
                 _,
-            ) = _sequence_alignment_plan(
-                segment,
-                duration,
-                chunk,
-                chunk_target_times,
-                config,
-            )
+            ) = candidate_plan
             alignment_score = 1.0 - min(alignment_error / max(duration, 1e-6), 1.0)
             has_key_events = bool(segment.get("key_event_times"))
             event_bonus = 0.05 if has_key_events else 0.0
-            if has_key_events and chunk.get("sync_target_time") is not None:
+            if has_key_events and scoring_chunk.get("sync_target_time") is not None:
                 event_bonus += 0.08
             sequence_bonus = 0.0
             if matched_event_count >= config.minimum_sequence_match_count:
@@ -1020,6 +1123,14 @@ def assign_clips(
             elif len(chunk_target_times) >= config.minimum_sequence_match_count:
                 sequence_bonus -= config.single_point_match_penalty
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
+            continuity_bonus = _continuity_bonus(
+                previous_clip,
+                previous_segment,
+                segment,
+                clip_start,
+                clip_end,
+                requires_event_match,
+            )
             weighted_score = (
                 (intensity_match * 0.34)
                 + (normalized_segment_score * segment_score_weight)
@@ -1029,10 +1140,26 @@ def assign_clips(
                 + event_bonus
                 + sequence_bonus
             ) / reuse_penalty
+            weighted_score += continuity_bonus
+            if weighted_score > fallback_score:
+                fallback_score = weighted_score
+                fallback_pool = pool_name
+                fallback_index = index
+                fallback_plan = candidate_plan
+            if requires_event_match and matched_event_count <= 0:
+                continue
             if weighted_score > best_score:
                 best_score = weighted_score
                 best_pool = pool_name
                 best_index = index
+                best_plan = candidate_plan
+
+        if best_plan is None:
+            if fallback_plan is None:
+                raise ValueError(f"No candidate clips were available for chunk {order}.")
+            best_pool = fallback_pool
+            best_index = fallback_index
+            best_plan = fallback_plan
 
         if best_pool == "fight":
             selected_segment = remaining_fight_segments.pop(best_index)
@@ -1050,13 +1177,7 @@ def assign_clips(
             sequence_interval_error,
             matched_source_event_times,
             matched_target_times,
-        ) = _sequence_alignment_plan(
-            selected_segment,
-            duration,
-            chunk,
-            chunk_target_times,
-            config,
-        )
+        ) = best_plan
 
         clips.append(
             MatchedClipRecord(
@@ -1076,6 +1197,7 @@ def assign_clips(
                 matched_target_times=matched_target_times,
             )
         )
+        previous_segment = selected_segment
 
     return clips
 
