@@ -582,52 +582,175 @@ def _segment_time_gap(left_segment: dict, right_segment: dict) -> float:
     return 0.0
 
 
+def _clip_continuity_metrics(
+    previous_clip: MatchedClipRecord,
+    clip_start: float,
+    clip_end: float,
+) -> tuple[float, float, float, float]:
+    previous_start = float(previous_clip.clip_start)
+    previous_end = float(previous_clip.clip_end)
+    previous_center = (previous_start + previous_end) * 0.5
+    current_center = (clip_start + clip_end) * 0.5
+    forward_gap = clip_start - previous_end
+    center_gap = abs(current_center - previous_center)
+    overlap_seconds = max(0.0, min(clip_end, previous_end) - max(clip_start, previous_start))
+    return forward_gap, abs(forward_gap), center_gap, overlap_seconds
+
+
+def _extends_local_continuity_run(
+    previous_clip: MatchedClipRecord | None,
+    source_path: str,
+    clip_start: float,
+    clip_end: float,
+    requires_event_match: bool,
+) -> bool:
+    if previous_clip is None or source_path != previous_clip.source_path:
+        return False
+
+    forward_gap, handoff_gap, center_gap, overlap_seconds = _clip_continuity_metrics(
+        previous_clip,
+        clip_start,
+        clip_end,
+    )
+    soft_handoff_window = 16.0 if requires_event_match else 24.0
+    soft_center_window = 24.0 if requires_event_match else 40.0
+    overlap_limit = max(min(float(previous_clip.duration), clip_end - clip_start) * 0.35, 0.12)
+    return (
+        forward_gap >= -0.12
+        and handoff_gap <= soft_handoff_window
+        and center_gap <= soft_center_window
+        and overlap_seconds <= overlap_limit
+    )
+
+
+def _trajectory_bonus(
+    previous_previous_clip: MatchedClipRecord | None,
+    previous_clip: MatchedClipRecord | None,
+    source_path: str,
+    clip_start: float,
+    clip_end: float,
+) -> float:
+    if (
+        previous_previous_clip is None
+        or previous_clip is None
+        or source_path != previous_clip.source_path
+        or previous_previous_clip.source_path != previous_clip.source_path
+    ):
+        return 0.0
+
+    previous_previous_center = (float(previous_previous_clip.clip_start) + float(previous_previous_clip.clip_end)) * 0.5
+    previous_center = (float(previous_clip.clip_start) + float(previous_clip.clip_end)) * 0.5
+    current_center = (clip_start + clip_end) * 0.5
+    last_delta = previous_center - previous_previous_center
+    current_delta = current_center - previous_center
+
+    if abs(last_delta) < 3.0 or abs(current_delta) < 3.0:
+        return 0.0
+
+    if last_delta * current_delta < 0.0:
+        return -0.18 * min(abs(current_delta) / max(abs(last_delta), 1e-6), 1.5)
+
+    pace_ratio = min(abs(current_delta), abs(last_delta)) / max(abs(current_delta), abs(last_delta), 1e-6)
+    return 0.08 + (0.08 * pace_ratio)
+
+
 def _continuity_bonus(
+    previous_previous_clip: MatchedClipRecord | None,
     previous_clip: MatchedClipRecord | None,
     previous_segment: dict | None,
     segment: dict,
     clip_start: float,
     clip_end: float,
     requires_event_match: bool,
+    continuity_streak: int,
 ) -> float:
-    if previous_clip is None or segment.get("source_path") != previous_clip.source_path:
+    if previous_clip is None:
         return 0.0
 
+    source_path = str(segment.get("source_path", ""))
+    if source_path != previous_clip.source_path:
+        return -0.06 * min(max(continuity_streak, 1), 3)
+
     previous_start = float(previous_clip.clip_start)
-    previous_end = float(previous_clip.clip_end)
-    previous_center = (previous_start + previous_end) * 0.5
-    current_center = (clip_start + clip_end) * 0.5
+    forward_gap, handoff_gap, center_gap, overlap_seconds = _clip_continuity_metrics(
+        previous_clip,
+        clip_start,
+        clip_end,
+    )
 
-    center_gap = abs(current_center - previous_center)
-    handoff_gap = abs(clip_start - previous_end)
-    proximity_window = 18.0 if requires_event_match else 26.0
-    handoff_window = 8.0 if requires_event_match else 12.0
+    preferred_center_window = 12.0 if requires_event_match else 18.0
+    soft_center_window = 32.0 if requires_event_match else 50.0
+    hard_center_window = 140.0 if requires_event_match else 220.0
+    preferred_handoff_window = 3.5 if requires_event_match else 6.5
+    soft_handoff_window = 14.0 if requires_event_match else 22.0
+    hard_handoff_window = 65.0 if requires_event_match else 110.0
 
-    center_score = max(0.0, 1.0 - (center_gap / proximity_window))
-    handoff_score = max(0.0, 1.0 - (handoff_gap / handoff_window))
+    center_score = max(0.0, 1.0 - (center_gap / preferred_center_window))
+    handoff_score = max(0.0, 1.0 - (handoff_gap / preferred_handoff_window))
+
+    forward_progress_bonus = 0.0
+    if -0.08 <= forward_gap <= preferred_handoff_window:
+        forward_progress_bonus = 0.12 * (
+            1.0 - (max(forward_gap, 0.0) / max(preferred_handoff_window, 1e-6))
+        )
 
     segment_proximity_bonus = 0.0
     if previous_segment is not None:
         segment_gap = _segment_time_gap(previous_segment, segment)
         if math.isfinite(segment_gap):
-            segment_proximity_bonus = 0.08 * max(0.0, 1.0 - (segment_gap / 10.0))
+            segment_proximity_bonus = 0.16 * max(0.0, 1.0 - (segment_gap / 12.0))
+            if segment_gap <= 2.5:
+                segment_proximity_bonus += 0.06
 
-    overlap_seconds = max(0.0, min(clip_end, previous_end) - max(clip_start, previous_start))
+    jump_penalty = 0.0
+    if handoff_gap > soft_handoff_window:
+        jump_penalty += 0.24 * min(
+            (handoff_gap - soft_handoff_window) / max(hard_handoff_window - soft_handoff_window, 1e-6),
+            1.0,
+        )
+    if center_gap > soft_center_window:
+        jump_penalty += 0.32 * min(
+            (center_gap - soft_center_window) / max(hard_center_window - soft_center_window, 1e-6),
+            1.0,
+        )
+
     overlap_penalty = 0.0
     if overlap_seconds > 0.0:
         overlap_denominator = max(min(float(previous_clip.duration), clip_end - clip_start), 1e-6)
-        overlap_penalty = 0.16 * min(overlap_seconds / overlap_denominator, 1.0)
+        overlap_penalty = 0.22 * min(overlap_seconds / overlap_denominator, 1.0)
 
     backward_penalty = 0.0
-    if clip_start + 0.2 < previous_start:
-        backward_penalty = 0.1 * min((previous_start - clip_start) / 20.0, 1.0)
+    if forward_gap < -0.12:
+        backward_penalty += 0.18 * min(abs(forward_gap) / 30.0, 1.0)
+    if clip_start + 0.12 < previous_start:
+        backward_penalty += 0.18 * min((previous_start - clip_start) / 35.0, 1.0)
 
-    continuity_weight = 0.18 if requires_event_match else 0.26
+    streak_bonus = 0.0
+    if continuity_streak > 0 and _extends_local_continuity_run(
+        previous_clip,
+        source_path,
+        clip_start,
+        clip_end,
+        requires_event_match,
+    ):
+        streak_bonus = 0.05 * min(continuity_streak, 3)
+
+    trajectory_bonus = _trajectory_bonus(
+        previous_previous_clip,
+        previous_clip,
+        source_path,
+        clip_start,
+        clip_end,
+    )
     return (
-        0.04
-        + (center_score * continuity_weight)
-        + (handoff_score * 0.08)
+        0.02
+        + (center_score * 0.22)
+        + (handoff_score * 0.16)
+        + forward_progress_bonus
         + segment_proximity_bonus
+        + streak_bonus
+        + trajectory_bonus
+        - jump_penalty
         - overlap_penalty
         - backward_penalty
     )
@@ -1014,6 +1137,7 @@ def assign_clips(
     reuse_count: defaultdict[str, int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
     previous_segment: dict | None = None
+    continuity_streak = 0
     alignment_soft_limit = config.sequence_match_max_average_error_seconds
     alignment_hard_limit = max(
         config.candidate_alignment_max_error_seconds,
@@ -1072,6 +1196,7 @@ def assign_clips(
         fallback_key: tuple[int, float, float] | None = None
         fallback_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
         previous_clip = clips[-1] if clips else None
+        previous_previous_clip = clips[-2] if len(clips) >= 2 else None
         for pool_name, index, segment in candidate_segments:
             if pool_name == "fight":
                 normalized_segment_score = (float(segment["score"]) - fight_min) / fight_spread
@@ -1142,12 +1267,14 @@ def assign_clips(
                     sequence_bonus -= config.single_point_match_penalty
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
             continuity_bonus = _continuity_bonus(
+                previous_previous_clip,
                 previous_clip,
                 previous_segment,
                 segment,
                 clip_start,
                 clip_end,
                 requires_event_match,
+                continuity_streak,
             )
             alignment_penalty = 0.0
             if requires_event_match and alignment_error > alignment_soft_limit:
@@ -1228,6 +1355,16 @@ def assign_clips(
                 matched_target_times=matched_target_times,
             )
         )
+        if _extends_local_continuity_run(
+            previous_clip,
+            selected_segment["source_path"],
+            clip_start,
+            clip_end,
+            requires_event_match,
+        ):
+            continuity_streak += 1
+        else:
+            continuity_streak = 0
         previous_segment = selected_segment
 
     return clips

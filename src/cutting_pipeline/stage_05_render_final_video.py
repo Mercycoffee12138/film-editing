@@ -260,7 +260,20 @@ def _render_clip(
     clip: dict,
     output_path: Path,
 ) -> None:
+    trimmed_path = str(clip["trimmed_path"])
+    trimmed_input_path = _resolve_project_path(config.paths.project_root, trimmed_path)
     safe_start = max(float(clip["clip_start"]), 0.0)
+    input_path = trimmed_input_path
+
+    if not _path_is_nonempty(trimmed_input_path):
+        trimmed_lookup = _trim_source_lookup(config).get(trimmed_path)
+        if trimmed_lookup is not None:
+            input_path = _resolve_project_path(
+                config.paths.project_root,
+                str(trimmed_lookup["source_path"]),
+            )
+            safe_start += float(trimmed_lookup.get("trim_start", 0.0) or 0.0)
+
     safe_duration = max(float(clip["duration"]), 0.01)
     seek_start = max(safe_start - 1.0, 0.0)
     trim_start = safe_start - seek_start
@@ -273,7 +286,7 @@ def _render_clip(
         "-ss",
         f"{seek_start:.3f}",
         "-i",
-        str(config.paths.project_root / clip["trimmed_path"]),
+        str(input_path),
         "-an",
         "-vf",
         (
