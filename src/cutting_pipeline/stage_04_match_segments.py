@@ -128,6 +128,15 @@ def _target_intensity(
     return max(0.0, min(1.0, intensity))
 
 
+def _segment_reuse_key(segment: dict) -> tuple[str, str, float, float]:
+    return (
+        str(segment["source_path"]),
+        str(segment["trimmed_path"]),
+        round(float(segment["start"]), 3),
+        round(float(segment["end"]), 3),
+    )
+
+
 def _target_chunk_duration(
     center_time: float,
     audio_start: float,
@@ -756,6 +765,28 @@ def _continuity_bonus(
     )
 
 
+def _timeline_order_penalty(
+    previous_clip: MatchedClipRecord | None,
+    segment: dict,
+    clip_start: float,
+    config: MatchConfig,
+) -> float:
+    if previous_clip is None:
+        return 0.0
+
+    source_path = str(segment.get("source_path", ""))
+    if source_path != previous_clip.source_path:
+        return 0.08
+
+    previous_start = float(previous_clip.clip_start)
+    tolerance = max(float(config.source_timeline_backtrack_tolerance_seconds), 0.0)
+    if clip_start + tolerance >= previous_start:
+        return 0.0
+
+    backtrack_seconds = previous_start - clip_start
+    return 0.18 + (0.34 * min(backtrack_seconds / 36.0, 1.0))
+
+
 def _sequence_alignment_plan(
     segment: dict,
     duration: float,
@@ -1134,7 +1165,8 @@ def assign_clips(
 
     remaining_fight_segments = list(ranked_fight_segments)
     remaining_calm_segments = list(ranked_calm_segments)
-    reuse_count: defaultdict[str, int] = defaultdict(int)
+    source_reuse_count: defaultdict[str, int] = defaultdict(int)
+    segment_reuse_count: defaultdict[tuple[str, str, float, float], int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
     previous_segment: dict | None = None
     continuity_streak = 0
@@ -1265,7 +1297,12 @@ def assign_clips(
                     sequence_bonus -= config.single_point_match_penalty * 0.25
                 else:
                     sequence_bonus -= config.single_point_match_penalty
-            reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
+            segment_key = _segment_reuse_key(segment)
+            reuse_penalty = 1.0 + (
+                source_reuse_count[segment["source_path"]] * config.source_reuse_penalty
+            ) + (
+                segment_reuse_count[segment_key] * config.segment_reuse_penalty
+            )
             continuity_bonus = _continuity_bonus(
                 previous_previous_clip,
                 previous_clip,
@@ -1275,6 +1312,12 @@ def assign_clips(
                 clip_end,
                 requires_event_match,
                 continuity_streak,
+            )
+            timeline_order_penalty = _timeline_order_penalty(
+                previous_clip,
+                segment,
+                clip_start,
+                config,
             )
             alignment_penalty = 0.0
             if requires_event_match and alignment_error > alignment_soft_limit:
@@ -1291,7 +1334,8 @@ def assign_clips(
                 + event_bonus
                 + sequence_bonus
             ) / reuse_penalty
-            weighted_score += continuity_bonus - alignment_penalty
+            weighted_score += (continuity_bonus * config.source_timeline_order_weight)
+            weighted_score -= timeline_order_penalty + alignment_penalty
             fallback_candidate_key = (
                 1 if (not requires_event_match or alignment_error <= alignment_hard_limit) else 0,
                 -alignment_error if requires_event_match else 0.0,
@@ -1323,7 +1367,8 @@ def assign_clips(
             selected_segment = remaining_fight_segments.pop(best_index)
         else:
             selected_segment = remaining_calm_segments.pop(best_index)
-        reuse_count[selected_segment["source_path"]] += 1
+        source_reuse_count[selected_segment["source_path"]] += 1
+        segment_reuse_count[_segment_reuse_key(selected_segment)] += 1
 
         (
             clip_start,

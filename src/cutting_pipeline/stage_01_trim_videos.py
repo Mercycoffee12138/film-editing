@@ -40,8 +40,11 @@ def run(config: PipelineConfig, reporter: StageReporter) -> dict:
 
         duration = get_media_duration(source_path)
         trim_start = config.trim.head_trim_seconds
-        trim_end = config.trim.tail_trim_seconds
-        trimmed_duration = duration - trim_start - trim_end
+        source_end = max(duration - config.trim.tail_trim_seconds, trim_start)
+        if config.trim.max_source_end_seconds is not None:
+            source_end = min(source_end, float(config.trim.max_source_end_seconds))
+        trim_end = max(duration - source_end, 0.0)
+        trimmed_duration = source_end - trim_start
 
         if trimmed_duration < config.trim.minimum_remaining_seconds:
             raise ValueError(f"Trimmed duration too short for {source_path.name}")

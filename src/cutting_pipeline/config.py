@@ -9,6 +9,7 @@ import re
 class TrimConfig:
     head_trim_seconds: float = 3.0
     tail_trim_seconds: float = 3.0
+    max_source_end_seconds: float | None = 94 * 60.0
     minimum_remaining_seconds: float = 5.0
 
 
@@ -36,11 +37,11 @@ class AudioConfig:
     hop_length: int = 1024
     min_peak_distance_seconds: float = 2.2
     top_highlights: int = 20
-    peak_threshold_quantile: float = 0.8
+    peak_threshold_quantile: float = 0.76
     beat_min_distance_seconds: float = 0.22
     beat_top_candidates: int = 360
-    beat_threshold_quantile: float = 0.6
-    beat_sparse_threshold_quantile: float = 0.84
+    beat_threshold_quantile: float = 0.56
+    beat_sparse_threshold_quantile: float = 0.8
     beat_sparse_distance_scale: float = 1.15
     beat_score_accent_weight: float = 0.86
     beat_score_energy_weight: float = 0.14
@@ -60,17 +61,17 @@ class FightAIConfig:
     coarse_merge_gap_seconds: float = 1.4
     fine_anchor_frames: int = 5
     fine_event_context_seconds: float = 0.18
-    fine_max_event_candidates: int = 10
-    audio_candidate_min_spacing_seconds: float = 0.12
-    audio_candidate_peak_quantile: float = 0.86
+    fine_max_event_candidates: int = 6
+    audio_candidate_min_spacing_seconds: float = 0.24
+    audio_candidate_peak_quantile: float = 0.9
     audio_candidate_speech_band_max_hz: float = 1600.0
     audio_candidate_impact_band_min_hz: float = 1800.0
     audio_candidate_impact_band_max_hz: float = 9000.0
-    audio_candidate_speech_penalty_weight: float = 0.42
+    audio_candidate_speech_penalty_weight: float = 0.56
     max_key_events_per_segment: int = 10
-    refined_audio_candidate_min_spacing_seconds: float = 0.12
-    refined_audio_candidate_peak_quantile: float = 0.74
-    refined_max_event_candidates: int = 8
+    refined_audio_candidate_min_spacing_seconds: float = 0.24
+    refined_audio_candidate_peak_quantile: float = 0.84
+    refined_max_event_candidates: int = 3
     refined_visual_analysis_fps: int = 12
     refined_visual_candidate_min_spacing_seconds: float = 0.12
     collision_repeat_score_ratio: float = 0.6
@@ -81,7 +82,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "004.mp3"
+    selected_music_filename: str | None = "008.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 42.0
     max_highlights_per_track: int = 16
@@ -93,6 +94,9 @@ class MatchConfig:
     beat_cut_min_clip_seconds: float = 0.14
     beat_cut_max_clip_seconds: float = 1.05
     source_reuse_penalty: float = 0.25
+    segment_reuse_penalty: float = 1.1
+    source_timeline_order_weight: float = 2.2
+    source_timeline_backtrack_tolerance_seconds: float = 0.18
     minimum_sequence_match_count: int = 2
     preferred_sequence_match_count: int = 3
     single_point_match_penalty: float = 0.18
@@ -119,7 +123,7 @@ class RenderConfig:
     video_crf: int = 18
     video_preset: str = "veryfast"
     audio_bitrate: str = "192k"
-    include_source_hit_audio: bool = True
+    include_source_hit_audio: bool = False
     music_volume: float = 0.95
     source_hit_volume: float = 3.4
     source_hit_single_point_volume: float = 2.8
