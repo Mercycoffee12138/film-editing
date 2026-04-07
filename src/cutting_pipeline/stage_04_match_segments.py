@@ -512,6 +512,29 @@ def _alignment_plan(
     )
 
 
+def _single_alignment_plan(
+    segment: dict,
+    duration: float,
+    chunk: dict,
+) -> tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]]:
+    clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
+        segment,
+        duration,
+        chunk,
+    )
+    return (
+        clip_start,
+        clip_end,
+        source_event_time,
+        target_highlight_time,
+        alignment_error,
+        1 if target_highlight_time is not None else 0,
+        None,
+        [round(float(source_event_time), 3)] if target_highlight_time is not None else [],
+        [round(float(target_highlight_time), 3)] if target_highlight_time is not None else [],
+    )
+
+
 def _chunk_target_times(timeline_chunks: list[dict], chunk_index: int) -> list[float]:
     chunk = timeline_chunks[chunk_index]
     return sorted(round(float(value), 3) for value in (chunk.get("sync_target_times") or []))
@@ -617,7 +640,7 @@ def _sequence_alignment_plan(
     target_times: list[float],
     config: MatchConfig,
 ) -> tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]]:
-    clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
+    single_alignment_plan = _single_alignment_plan(
         segment,
         duration,
         chunk,
@@ -625,17 +648,7 @@ def _sequence_alignment_plan(
     event_times = _segment_event_times(segment)
     minimum_match_count = max(2, config.minimum_sequence_match_count)
     if len(target_times) < minimum_match_count or len(event_times) < minimum_match_count:
-        return (
-            clip_start,
-            clip_end,
-            source_event_time,
-            target_highlight_time,
-            alignment_error,
-            1 if target_highlight_time is not None else 0,
-            None,
-            [round(float(source_event_time), 3)] if target_highlight_time is not None else [],
-            [round(float(target_highlight_time), 3)] if target_highlight_time is not None else [],
-        )
+        return single_alignment_plan
 
     max_start = max(float(segment["video_duration"]) - duration, 0.0)
     chunk_start = float(chunk["start"])
@@ -677,6 +690,13 @@ def _sequence_alignment_plan(
                         source_gap = source_right - source_left
                         interval_ratios.append(abs(source_gap - target_gap) / target_gap)
                     interval_error = sum(interval_ratios) / len(interval_ratios) if interval_ratios else 0.0
+                if average_error > config.sequence_match_max_average_error_seconds:
+                    continue
+                if (
+                    interval_error is not None
+                    and interval_error > config.sequence_match_max_interval_error
+                ):
+                    continue
                 effective_interval_error = interval_error if interval_error is not None else 1.0
                 candidate_key = (
                     match_count,
@@ -706,17 +726,7 @@ def _sequence_alignment_plan(
                     best_reference_event = event_window[reference_index]
 
     if best_sequence is None or best_reference_event is None:
-        return (
-            clip_start,
-            clip_end,
-            source_event_time,
-            target_highlight_time,
-            alignment_error,
-            1 if target_highlight_time is not None else 0,
-            None,
-            [round(float(source_event_time), 3)] if target_highlight_time is not None else [],
-            [round(float(target_highlight_time), 3)] if target_highlight_time is not None else [],
-        )
+        return single_alignment_plan
 
     matched_event_count, average_error, interval_error, best_clip_start, matched_event_times, matched_target_times = best_sequence
     best_clip_end = best_clip_start + duration
@@ -1004,6 +1014,11 @@ def assign_clips(
     reuse_count: defaultdict[str, int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
     previous_segment: dict | None = None
+    alignment_soft_limit = config.sequence_match_max_average_error_seconds
+    alignment_hard_limit = max(
+        config.candidate_alignment_max_error_seconds,
+        alignment_soft_limit + 1e-6,
+    )
 
     for order, chunk in enumerate(timeline_chunks, start=1):
         chunk_index = order - 1
@@ -1054,7 +1069,7 @@ def assign_clips(
         best_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
         fallback_pool = candidate_segments[0][0]
         fallback_index = 0
-        fallback_score = float("-inf")
+        fallback_key: tuple[int, float, float] | None = None
         fallback_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
         previous_clip = clips[-1] if clips else None
         for pool_name, index, segment in candidate_segments:
@@ -1121,7 +1136,10 @@ def assign_clips(
                 if sequence_interval_error is not None:
                     sequence_bonus += 0.10 * (1.0 - min(sequence_interval_error, 1.0))
             elif len(chunk_target_times) >= config.minimum_sequence_match_count:
-                sequence_bonus -= config.single_point_match_penalty
+                if alignment_error <= alignment_soft_limit:
+                    sequence_bonus -= config.single_point_match_penalty * 0.25
+                else:
+                    sequence_bonus -= config.single_point_match_penalty
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
             continuity_bonus = _continuity_bonus(
                 previous_clip,
@@ -1131,6 +1149,12 @@ def assign_clips(
                 clip_end,
                 requires_event_match,
             )
+            alignment_penalty = 0.0
+            if requires_event_match and alignment_error > alignment_soft_limit:
+                alignment_penalty = 0.32 * min(
+                    (alignment_error - alignment_soft_limit) / (alignment_hard_limit - alignment_soft_limit),
+                    1.0,
+                )
             weighted_score = (
                 (intensity_match * 0.34)
                 + (normalized_segment_score * segment_score_weight)
@@ -1140,12 +1164,19 @@ def assign_clips(
                 + event_bonus
                 + sequence_bonus
             ) / reuse_penalty
-            weighted_score += continuity_bonus
-            if weighted_score > fallback_score:
-                fallback_score = weighted_score
+            weighted_score += continuity_bonus - alignment_penalty
+            fallback_candidate_key = (
+                1 if (not requires_event_match or alignment_error <= alignment_hard_limit) else 0,
+                -alignment_error if requires_event_match else 0.0,
+                weighted_score,
+            )
+            if fallback_key is None or fallback_candidate_key > fallback_key:
+                fallback_key = fallback_candidate_key
                 fallback_pool = pool_name
                 fallback_index = index
                 fallback_plan = candidate_plan
+            if requires_event_match and alignment_error > alignment_hard_limit:
+                continue
             if requires_event_match and matched_event_count <= 0:
                 continue
             if weighted_score > best_score:

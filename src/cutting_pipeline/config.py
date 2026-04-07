@@ -97,6 +97,9 @@ class MatchConfig:
     preferred_sequence_match_count: int = 3
     single_point_match_penalty: float = 0.18
     beat_boundary_threshold_quantile: float = 0.75
+    sequence_match_max_average_error_seconds: float = 0.12
+    sequence_match_max_interval_error: float = 0.45
+    candidate_alignment_max_error_seconds: float = 0.18
 
 
 @dataclass(frozen=True)
@@ -118,13 +121,16 @@ class RenderConfig:
     audio_bitrate: str = "192k"
     include_source_hit_audio: bool = True
     music_volume: float = 0.95
-    source_hit_volume: float = 8
-    source_hit_pre_seconds: float = 0.18
-    source_hit_post_seconds: float = 0.45
+    source_hit_volume: float = 3.4
+    source_hit_single_point_volume: float = 2.8
+    source_hit_two_point_volume: float = 3.4
+    source_hit_three_point_volume: float = 3.8
+    source_hit_pre_seconds: float = 0.09
+    source_hit_post_seconds: float = 0.22
     source_hit_fade_seconds: float = 0.05
-    source_hit_min_segment_seconds: float = 0.36
+    source_hit_min_segment_seconds: float = 0.24
     source_hit_full_clip_threshold_seconds: float = 0.0
-    source_hit_max_events_per_clip: int = 2
+    source_hit_max_events_per_clip: int = 3
 
 
 @dataclass(frozen=True)
