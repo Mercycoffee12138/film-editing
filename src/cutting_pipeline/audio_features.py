@@ -6,6 +6,10 @@ import numpy as np
 def moving_average(values: np.ndarray, window_size: int) -> np.ndarray:
     if window_size <= 1 or values.size == 0:
         return values
+    # Keep the smoothed output aligned with the input even for very short clips.
+    window_size = min(int(window_size), int(values.size))
+    if window_size <= 1:
+        return values
     kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
     return np.convolve(values, kernel, mode="same")
 

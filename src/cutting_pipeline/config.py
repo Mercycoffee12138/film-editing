@@ -7,9 +7,9 @@ import re
 
 @dataclass(frozen=True)
 class TrimConfig:
-    head_trim_seconds: float = 3.0
-    tail_trim_seconds: float = 3.0
-    max_source_end_seconds: float | None = 94 * 60.0
+    head_trim_seconds: float = 3 * 60 * 60.0
+    tail_trim_seconds: float = 0.0
+    max_source_end_seconds: float | None = None
     minimum_remaining_seconds: float = 5.0
 
 
@@ -82,7 +82,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "008.mp3"
+    selected_music_filename: str | None = "only_girl.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 42.0
     max_highlights_per_track: int = 16
