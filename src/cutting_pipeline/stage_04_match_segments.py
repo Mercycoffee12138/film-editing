@@ -41,7 +41,59 @@ def select_highlight_cluster(
             best_score = score
             best_selection = selected
 
-    return best_selection
+    if not best_selection:
+        return []
+
+    selected_times = {round(float(item["time"]), 3) for item in best_selection}
+    spacing_seconds = max(float(config.highlight_min_spacing_seconds), 0.0)
+    cluster_start = min(float(item["time"]) for item in best_selection)
+    cluster_end = max(float(item["time"]) for item in best_selection)
+    outside_candidates = sorted(
+        (
+            highlight
+            for highlight in highlights
+            if round(float(highlight["time"]), 3) not in selected_times
+            and (
+                float(highlight["time"]) < cluster_start - spacing_seconds
+                or float(highlight["time"]) > cluster_end + spacing_seconds
+            )
+        ),
+        key=lambda item: float(item["score"]),
+        reverse=True,
+    )
+
+    enriched = list(best_selection)
+    outside_limit = min(
+        max(int(config.highlight_global_fill_count), 0),
+        max(config.max_highlights_per_track - len(enriched), 0),
+    )
+    for highlight in outside_candidates:
+        highlight_time = float(highlight["time"])
+        if any(abs(float(existing["time"]) - highlight_time) < spacing_seconds for existing in enriched):
+            continue
+        enriched.append(highlight)
+        if len(enriched) >= len(best_selection) + outside_limit:
+            break
+
+    if len(enriched) < config.max_highlights_per_track:
+        remaining_candidates = sorted(
+            (
+                highlight
+                for highlight in highlights
+                if round(float(highlight["time"]), 3) not in {round(float(item["time"]), 3) for item in enriched}
+            ),
+            key=lambda item: float(item["score"]),
+            reverse=True,
+        )
+        for highlight in remaining_candidates:
+            highlight_time = float(highlight["time"])
+            if any(abs(float(existing["time"]) - highlight_time) < spacing_seconds for existing in enriched):
+                continue
+            enriched.append(highlight)
+            if len(enriched) >= config.max_highlights_per_track:
+                break
+
+    return sorted(enriched, key=lambda item: item["time"])
 
 
 def _merge_unique_highlights(highlights: list[dict]) -> list[dict]:
@@ -151,11 +203,17 @@ def _target_chunk_duration(
         distance = abs(center_time - float(highlight["time"]))
         peak_proximity = max(peak_proximity, max(0.0, 1.0 - (distance / peak_window_seconds)))
 
-    # Keep calmer passages longer, and tighten cuts near musical peaks.
-    compression = max(0.0, (intensity - 0.35) / 0.65)
-    compression = min(1.0, compression + (peak_proximity * 0.35))
+    # Favor longer shots through calmer passages and reserve rapid cutting for stronger peaks.
+    compression = max(0.0, (intensity - 0.42) / 0.58)
+    compression = min(1.0, compression + (peak_proximity * 0.28))
     duration_span = config.max_clip_seconds - config.min_clip_seconds
-    target_duration = config.max_clip_seconds - (duration_span * 0.9 * compression)
+    target_duration = config.max_clip_seconds - (duration_span * 0.82 * compression)
+    if intensity <= 0.3:
+        target_duration = max(target_duration, config.max_clip_seconds * 0.96)
+    elif intensity <= 0.41:
+        target_duration = max(target_duration, config.max_clip_seconds * 0.88)
+    elif intensity <= 0.5:
+        target_duration = max(target_duration, config.max_clip_seconds * 0.78)
     return max(config.min_clip_seconds, min(config.max_clip_seconds, target_duration))
 
 
@@ -1037,6 +1095,51 @@ def _enforce_minimum_chunk_duration(
     return merged
 
 
+def _linger_on_calm_chunks(
+    timeline: list[dict],
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    if not timeline:
+        return []
+
+    merged: list[dict] = []
+    max_calm_duration = max(config.max_clip_seconds * 1.55, 5.2)
+
+    for chunk in timeline:
+        current = dict(chunk)
+        if not merged:
+            merged.append(current)
+            continue
+
+        previous = merged[-1]
+        previous_targets = list(previous.get("sync_target_times") or [])
+        current_targets = list(current.get("sync_target_times") or [])
+        has_sync_targets = bool(previous_targets or current_targets)
+        calm_pair = (
+            float(previous["target_intensity"]) <= 0.43
+            and float(current["target_intensity"]) <= 0.43
+        )
+        combined_duration = float(current["end"]) - float(previous["start"])
+
+        if not has_sync_targets and calm_pair and combined_duration <= max_calm_duration:
+            merged[-1] = _make_chunk(
+                float(previous["start"]),
+                float(current["end"]),
+                audio_start,
+                audio_end,
+                selected_highlights,
+                disable_implicit_sync=True,
+            )
+            continue
+
+        merged.append(current)
+
+    return merged
+
+
 def build_timeline_chunks(
     audio_start: float,
     audio_end: float,
@@ -1064,6 +1167,13 @@ def build_timeline_chunks(
                 config,
             )
             beat_timeline = _enforce_minimum_chunk_duration(
+                beat_timeline,
+                audio_start,
+                audio_end,
+                selected_highlights,
+                config,
+            )
+            beat_timeline = _linger_on_calm_chunks(
                 beat_timeline,
                 audio_start,
                 audio_end,
@@ -1126,6 +1236,13 @@ def build_timeline_chunks(
         selected_highlights,
         config,
     )
+    timeline = _linger_on_calm_chunks(
+        timeline,
+        audio_start,
+        audio_end,
+        selected_highlights,
+        config,
+    )
     return _enforce_minimum_chunk_duration(
         timeline,
         audio_start,
@@ -1162,12 +1279,24 @@ def assign_clips(
     fight_probability_spread = max(max(fight_probabilities) - fight_probability_min, 1e-8)
     calm_min = min(calm_scores)
     calm_spread = max(max(calm_scores) - calm_min, 1e-8)
+    calm_threshold = float(config.calm_target_intensity_threshold)
+    total_timeline_duration = sum(float(chunk["duration"]) for chunk in timeline_chunks)
+    desired_calm_duration = sum(
+        float(chunk["duration"])
+        for chunk in timeline_chunks
+        if float(chunk["target_intensity"]) <= calm_threshold
+    )
+    max_calm_duration = min(
+        desired_calm_duration,
+        total_timeline_duration * max(min(float(config.calm_max_total_share), 1.0), 0.0),
+    )
 
     remaining_fight_segments = list(ranked_fight_segments)
     remaining_calm_segments = list(ranked_calm_segments)
     source_reuse_count: defaultdict[str, int] = defaultdict(int)
     segment_reuse_count: defaultdict[tuple[str, str, float, float], int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
+    assigned_calm_duration = 0.0
     previous_segment: dict | None = None
     continuity_streak = 0
     alignment_soft_limit = config.sequence_match_max_average_error_seconds
@@ -1176,59 +1305,24 @@ def assign_clips(
         alignment_soft_limit + 1e-6,
     )
 
-    for order, chunk in enumerate(timeline_chunks, start=1):
-        chunk_index = order - 1
-        duration = float(chunk["duration"])
-        target_intensity = float(chunk["target_intensity"])
-        chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
-        scoring_chunk = _resolve_chunk_alignment_target(chunk, chunk_target_times)
-        requires_event_match = bool(chunk_target_times) or scoring_chunk.get("sync_target_time") is not None
-        if chunk_target_times and ranked_fight_segments:
-            candidate_pool_name = "fight"
-        elif target_intensity <= 0.36 and ranked_calm_segments:
-            candidate_pool_name = "calm"
-        elif (target_intensity >= 0.52 and ranked_fight_segments) or not ranked_calm_segments:
-            candidate_pool_name = "fight"
-        else:
-            candidate_pool_name = "mixed"
-
-        if candidate_pool_name == "fight":
-            if not remaining_fight_segments:
-                remaining_fight_segments = list(ranked_fight_segments)
-            candidate_segments = [("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)]
-        elif candidate_pool_name == "calm":
-            if not remaining_calm_segments:
-                remaining_calm_segments = list(ranked_calm_segments)
-            candidate_segments = [("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)]
-        else:
-            if not remaining_calm_segments:
-                remaining_calm_segments = list(ranked_calm_segments)
-            if not remaining_fight_segments:
-                remaining_fight_segments = list(ranked_fight_segments)
-            candidate_segments = [
-                ("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)
-            ] + [
-                ("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)
-            ]
-
+    def _pick_best_candidate(
+        candidate_segments: list[tuple[str, int, dict]],
+        *,
+        duration: float,
+        target_intensity: float,
+        scoring_chunk: dict,
+        chunk_target_times: list[float],
+        requires_event_match: bool,
+        previous_clip: MatchedClipRecord | None,
+        previous_previous_clip: MatchedClipRecord | None,
+    ) -> dict | None:
         if not candidate_segments:
-            if ranked_fight_segments:
-                remaining_fight_segments = list(ranked_fight_segments)
-                candidate_segments = [("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)]
-            else:
-                remaining_calm_segments = list(ranked_calm_segments)
-                candidate_segments = [("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)]
+            return None
 
-        best_pool = candidate_segments[0][0]
-        best_index = 0
-        best_score = float("-inf")
-        best_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
-        fallback_pool = candidate_segments[0][0]
-        fallback_index = 0
+        best_candidate: dict | None = None
+        fallback_candidate: dict | None = None
         fallback_key: tuple[int, float, float] | None = None
-        fallback_plan: tuple[float, float, float, float | None, float, int, float | None, list[float], list[float]] | None = None
-        previous_clip = clips[-1] if clips else None
-        previous_previous_clip = clips[-2] if len(clips) >= 2 else None
+
         for pool_name, index, segment in candidate_segments:
             if pool_name == "fight":
                 normalized_segment_score = (float(segment["score"]) - fight_min) / fight_spread
@@ -1254,10 +1348,15 @@ def assign_clips(
                 normalized_segment_score = (float(segment["score"]) - calm_min) / calm_spread
                 normalized_fight_probability = 0.0
                 normalized_segment_level = normalized_segment_score
-                segment_score_weight = 0.18
+                segment_score_weight = 0.22
                 fight_probability_weight = 0.0
                 desired_level = 1.0 - target_intensity
-                pool_bias = 0.08 if target_intensity <= 0.36 else 0.0
+                if target_intensity <= 0.41:
+                    pool_bias = 0.18
+                elif target_intensity <= 0.58:
+                    pool_bias = 0.08
+                else:
+                    pool_bias = 0.0
 
             intensity_match = 1.0 - abs(normalized_segment_level - desired_level)
             candidate_plan = _sequence_alignment_plan(
@@ -1336,6 +1435,14 @@ def assign_clips(
             ) / reuse_penalty
             weighted_score += (continuity_bonus * config.source_timeline_order_weight)
             weighted_score -= timeline_order_penalty + alignment_penalty
+
+            candidate_payload = {
+                "pool_name": pool_name,
+                "index": index,
+                "segment": segment,
+                "plan": candidate_plan,
+                "score": weighted_score,
+            }
             fallback_candidate_key = (
                 1 if (not requires_event_match or alignment_error <= alignment_hard_limit) else 0,
                 -alignment_error if requires_event_match else 0.0,
@@ -1343,30 +1450,102 @@ def assign_clips(
             )
             if fallback_key is None or fallback_candidate_key > fallback_key:
                 fallback_key = fallback_candidate_key
-                fallback_pool = pool_name
-                fallback_index = index
-                fallback_plan = candidate_plan
+                fallback_candidate = candidate_payload
             if requires_event_match and alignment_error > alignment_hard_limit:
                 continue
             if requires_event_match and matched_event_count <= 0:
                 continue
-            if weighted_score > best_score:
-                best_score = weighted_score
-                best_pool = pool_name
-                best_index = index
-                best_plan = candidate_plan
+            if best_candidate is None or weighted_score > float(best_candidate["score"]):
+                best_candidate = candidate_payload
 
-        if best_plan is None:
-            if fallback_plan is None:
+        return best_candidate or fallback_candidate
+
+    for order, chunk in enumerate(timeline_chunks, start=1):
+        chunk_index = order - 1
+        duration = float(chunk["duration"])
+        target_intensity = float(chunk["target_intensity"])
+        chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
+        scoring_chunk = _resolve_chunk_alignment_target(chunk, chunk_target_times)
+        requires_event_match = bool(chunk_target_times) or scoring_chunk.get("sync_target_time") is not None
+        previous_clip = clips[-1] if clips else None
+        previous_previous_clip = clips[-2] if len(clips) >= 2 else None
+
+        if not remaining_fight_segments and ranked_fight_segments:
+            remaining_fight_segments = list(ranked_fight_segments)
+        if not remaining_calm_segments and ranked_calm_segments:
+            remaining_calm_segments = list(ranked_calm_segments)
+
+        fight_candidates = [
+            ("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)
+        ]
+        calm_candidates = [
+            ("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)
+        ]
+
+        selected_candidate = _pick_best_candidate(
+            fight_candidates,
+            duration=duration,
+            target_intensity=target_intensity,
+            scoring_chunk=scoring_chunk,
+            chunk_target_times=chunk_target_times,
+            requires_event_match=requires_event_match,
+            previous_clip=previous_clip,
+            previous_previous_clip=previous_previous_clip,
+        )
+
+        remaining_calm_budget = max(0.0, max_calm_duration - assigned_calm_duration)
+        allow_calm_override = (
+            calm_candidates
+            and not requires_event_match
+            and target_intensity <= calm_threshold
+            and duration <= remaining_calm_budget + 1e-6
+        )
+        if allow_calm_override:
+            calm_candidate = _pick_best_candidate(
+                calm_candidates,
+                duration=duration,
+                target_intensity=target_intensity,
+                scoring_chunk=scoring_chunk,
+                chunk_target_times=chunk_target_times,
+                requires_event_match=requires_event_match,
+                previous_clip=previous_clip,
+                previous_previous_clip=previous_previous_clip,
+            )
+            if calm_candidate is not None:
+                if selected_candidate is None:
+                    selected_candidate = calm_candidate
+                else:
+                    replace_margin = float(config.calm_replace_score_margin)
+                    if target_intensity <= float(config.calm_force_intensity_threshold):
+                        replace_margin = min(replace_margin, 0.0)
+                    if float(calm_candidate["score"]) >= float(selected_candidate["score"]) + replace_margin:
+                        selected_candidate = calm_candidate
+
+        if selected_candidate is None:
+            fallback_candidates = calm_candidates or fight_candidates
+            selected_candidate = _pick_best_candidate(
+                fallback_candidates,
+                duration=duration,
+                target_intensity=target_intensity,
+                scoring_chunk=scoring_chunk,
+                chunk_target_times=chunk_target_times,
+                requires_event_match=requires_event_match,
+                previous_clip=previous_clip,
+                previous_previous_clip=previous_previous_clip,
+            )
+
+        if selected_candidate is None:
                 raise ValueError(f"No candidate clips were available for chunk {order}.")
-            best_pool = fallback_pool
-            best_index = fallback_index
-            best_plan = fallback_plan
+
+        best_pool = str(selected_candidate["pool_name"])
+        best_index = int(selected_candidate["index"])
+        best_plan = selected_candidate["plan"]
 
         if best_pool == "fight":
             selected_segment = remaining_fight_segments.pop(best_index)
         else:
             selected_segment = remaining_calm_segments.pop(best_index)
+            assigned_calm_duration += duration
         source_reuse_count[selected_segment["source_path"]] += 1
         segment_reuse_count[_segment_reuse_key(selected_segment)] += 1
 

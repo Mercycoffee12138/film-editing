@@ -36,20 +36,20 @@ class AudioConfig:
     frame_length: int = 2048
     hop_length: int = 1024
     min_peak_distance_seconds: float = 2.2
-    top_highlights: int = 20
-    peak_threshold_quantile: float = 0.76
-    beat_min_distance_seconds: float = 0.22
-    beat_top_candidates: int = 360
-    beat_threshold_quantile: float = 0.56
-    beat_sparse_threshold_quantile: float = 0.8
-    beat_sparse_distance_scale: float = 1.15
+    top_highlights: int = 24
+    peak_threshold_quantile: float = 0.72
+    beat_min_distance_seconds: float = 0.34
+    beat_top_candidates: int = 140
+    beat_threshold_quantile: float = 0.7
+    beat_sparse_threshold_quantile: float = 0.9
+    beat_sparse_distance_scale: float = 1.55
     beat_score_accent_weight: float = 0.86
     beat_score_energy_weight: float = 0.14
-    beat_group_min_gap_seconds: float = 0.14
-    beat_group_max_gap_seconds: float = 1.2
-    beat_group_max_gap_delta_seconds: float = 0.28
+    beat_group_min_gap_seconds: float = 0.18
+    beat_group_max_gap_seconds: float = 1.0
+    beat_group_max_gap_delta_seconds: float = 0.24
     beat_group_min_size: int = 2
-    beat_ai_dense_rhythm_bias: bool = True
+    beat_ai_dense_rhythm_bias: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,17 +82,23 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "only_girl.mp3"
+    selected_music_filename: str | None = "005.mp3"
     use_full_track_duration: bool = True
-    highlight_cluster_window_seconds: float = 42.0
+    highlight_cluster_window_seconds: float = 56.0
     max_highlights_per_track: int = 16
+    highlight_global_fill_count: int = 6
+    highlight_min_spacing_seconds: float = 4.0
     intro_padding_seconds: float = 4.0
     outro_padding_seconds: float = 6.0
-    min_clip_seconds: float = 0.5
-    max_clip_seconds: float = 3.0
+    min_clip_seconds: float = 0.7
+    max_clip_seconds: float = 3.8
+    calm_target_intensity_threshold: float = 0.40
+    calm_max_total_share: float = 0.32
+    calm_replace_score_margin: float = 0.05
+    calm_force_intensity_threshold: float = 0.24
     beat_cut_enabled: bool = True
-    beat_cut_min_clip_seconds: float = 0.14
-    beat_cut_max_clip_seconds: float = 1.05
+    beat_cut_min_clip_seconds: float = 0.24
+    beat_cut_max_clip_seconds: float = 1.35
     source_reuse_penalty: float = 0.25
     segment_reuse_penalty: float = 1.1
     source_timeline_order_weight: float = 2.2
@@ -100,7 +106,7 @@ class MatchConfig:
     minimum_sequence_match_count: int = 2
     preferred_sequence_match_count: int = 3
     single_point_match_penalty: float = 0.18
-    beat_boundary_threshold_quantile: float = 0.75
+    beat_boundary_threshold_quantile: float = 0.86
     sequence_match_max_average_error_seconds: float = 0.12
     sequence_match_max_interval_error: float = 0.45
     candidate_alignment_max_error_seconds: float = 0.18

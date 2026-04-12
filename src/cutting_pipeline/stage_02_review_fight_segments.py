@@ -681,6 +681,74 @@ def _export_collision_event_previews(
     }
 
 
+def _export_fight_segment_clips(
+    config: PipelineConfig,
+    reporter: StageReporter,
+    segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    export_dir = config.paths.build_dir / "stage_02_fight_segment_exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    clips_dir = export_dir / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_segments: list[dict[str, Any]] = []
+    total_segments = len(segments)
+
+    for index, segment in enumerate(segments, start=1):
+        reporter.update(
+            index / max(total_segments + 1, 1),
+            (
+                f"Exporting fight segment {index}/{total_segments} "
+                f"from {Path(segment['trimmed_path']).name}."
+            ),
+        )
+        trimmed_path = config.paths.project_root / segment["trimmed_path"]
+        segment_start = round(float(segment["start"]), 3)
+        segment_end = round(float(segment["end"]), 3)
+        duration = max(segment_end - segment_start, 0.01)
+        output_path = clips_dir / f"segment_{index:03d}.mp4"
+        render_video_clip(
+            trimmed_path,
+            output_path,
+            start_time=segment_start,
+            duration=duration,
+            width=config.render.output_width,
+            height=config.render.output_height,
+            fps=config.render.output_fps,
+            video_preset=config.render.video_preset,
+            video_crf=config.render.video_crf,
+            audio_bitrate=config.render.audio_bitrate,
+        )
+        manifest_segments.append(
+            {
+                "order": index,
+                "source_path": segment["source_path"],
+                "trimmed_path": segment["trimmed_path"],
+                "segment_start": segment_start,
+                "segment_end": segment_end,
+                "duration": round(duration, 3),
+                "score": round(float(segment.get("score", 0.0)), 6),
+                "fight_probability": round(float(segment.get("fight_probability", 0.0)), 4),
+                "output_path": str(output_path.relative_to(config.paths.project_root)),
+            }
+        )
+
+    manifest_path = export_dir / "fight_segments_manifest.json"
+    manifest = {
+        "segment_count": len(manifest_segments),
+        "clips_dir": str(clips_dir.relative_to(config.paths.project_root)),
+        "segments": manifest_segments,
+    }
+    write_json(manifest_path, manifest)
+
+    return {
+        "segment_count": len(manifest_segments),
+        "clips_dir": str(clips_dir.relative_to(config.paths.project_root)),
+        "manifest_path": str(manifest_path.relative_to(config.paths.project_root)),
+        "segments": manifest_segments,
+    }
+
+
 def _review_rank_key(segment: dict[str, Any]) -> tuple[float, float, float, float]:
     review = segment["review"]
     contains_fight_score = 1.0 if review["contains_fight"] else 0.0
@@ -738,6 +806,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
 
     vision_config = load_config_from_env() if config.review.enabled else None
     if not vision_config:
+        fight_segment_exports = _export_fight_segment_clips(config, reporter, candidates)
         payload = {
             "stage": "stage_02_review_fight_segments",
             "review_enabled": False,
@@ -746,6 +815,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
             "accepted_count": len(candidates),
             "top_segments": candidates,
             "calm_segments": list(fight_segments_payload.get("calm_segments") or []),
+            "fight_segment_exports": fight_segment_exports,
             "reviewed_segments": [],
         }
         output_path = config.paths.build_dir / "stage_02_reviewed_fight_segments.json"
@@ -788,6 +858,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
     accepted_segments = _apply_relaxed_acceptance(reviewed_segments, config)
     top_segments = accepted_segments or candidates
     top_segments = sorted(top_segments, key=lambda item: float(item["score"]), reverse=True)
+    fight_segment_exports = _export_fight_segment_clips(config, reporter, top_segments)
     payload = {
         "stage": "stage_02_review_fight_segments",
         "review_enabled": True,
@@ -799,6 +870,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
         ),
         "top_segments": top_segments,
         "calm_segments": list(fight_segments_payload.get("calm_segments") or []),
+        "fight_segment_exports": fight_segment_exports,
         "reviewed_segments": reviewed_segments,
     }
     output_path = config.paths.build_dir / "stage_02_reviewed_fight_segments.json"
