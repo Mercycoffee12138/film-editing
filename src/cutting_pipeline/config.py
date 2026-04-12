@@ -82,7 +82,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "005.mp3"
+    selected_music_filename: str | None = "dimonds.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 56.0
     max_highlights_per_track: int = 16
@@ -93,7 +93,7 @@ class MatchConfig:
     min_clip_seconds: float = 0.7
     max_clip_seconds: float = 3.8
     calm_target_intensity_threshold: float = 0.40
-    calm_max_total_share: float = 0.32
+    calm_max_total_share: float = 0.37
     calm_replace_score_margin: float = 0.05
     calm_force_intensity_threshold: float = 0.24
     beat_cut_enabled: bool = True
@@ -110,6 +110,10 @@ class MatchConfig:
     sequence_match_max_average_error_seconds: float = 0.12
     sequence_match_max_interval_error: float = 0.45
     candidate_alignment_max_error_seconds: float = 0.18
+    story_role_weight: float = 0.16
+    story_progress_weight: float = 0.08
+    story_transition_weight: float = 0.05
+    story_backtrack_penalty: float = 0.12
 
 
 @dataclass(frozen=True)

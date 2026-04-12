@@ -63,6 +63,9 @@ class MatchedClipRecord:
     sequence_interval_error: float | None = None
     matched_source_event_times: list[float] = field(default_factory=list)
     matched_target_times: list[float] = field(default_factory=list)
+    segment_story_role: str | None = None
+    music_story_section: str | None = None
+    story_fit_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,7 @@ class MatchPlanRecord:
     clips: list[MatchedClipRecord]
     plan_score: float
     selected_beats: list[MusicHighlightRecord] = field(default_factory=list)
+    music_story_arc: list[dict[str, Any]] = field(default_factory=list)
 
 
 def to_dict(instance: Any) -> Any:

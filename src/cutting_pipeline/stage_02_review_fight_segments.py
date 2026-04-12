@@ -458,6 +458,138 @@ def _refined_bounds(segment: dict, review: dict[str, Any]) -> tuple[float, float
     return round(refined_start, 3), round(refined_end, 3)
 
 
+def _infer_story_profile(segment: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+    summary = str(review.get("summary", "")).strip()
+    ocr_text = str(review.get("ocr_text", "")).strip()
+    combined_text = f"{summary}\n{ocr_text}"
+    duration = max(float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)), 0.01)
+    motion_level = max(
+        float(segment.get("fight_probability", 0.0)),
+        float(segment.get("peak_motion", 0.0)),
+        float(segment.get("mean_motion", 0.0)),
+        float(review.get("confidence", 0.0)),
+    )
+
+    role_keywords = {
+        "setup": ("准备", "蓄力", "现身", "出现", "站立", "看向", "观察", "进入", "逼近"),
+        "tension": ("对峙", "警觉", "紧张", "小心", "后面", "来了", "即将", "威胁", "压迫"),
+        "clash": ("打斗", "战斗", "攻击", "对抗", "激烈", "爆炸", "击飞", "受伤", "武器", "近身", "命中"),
+        "pursuit": ("追击", "追逐", "飞行", "穿梭", "冲刺", "空中", "移动", "奔跑", "突进", "高速"),
+        "aftermath": ("收尾", "结束", "最后", "烟雾", "废墟", "混乱", "残骸", "倒地", "爆炸后", "余波"),
+    }
+    role_priority_phrases = {
+        "setup": ("准备战斗", "即将开始", "即将或正在进行中", "前半部分为平静场景", "起始和结束有准备", "现身"),
+        "tension": ("紧张的对峙", "从两人对峙开始", "角色间的对峙", "警觉姿态", "对峙场景"),
+        "pursuit": ("高速移动", "高速飞行", "空中飞行", "空中追逐", "在爆炸中穿梭", "迅速移动", "坠落"),
+        "aftermath": ("收尾阶段", "告一段落", "爆炸后的烟雾", "后续效果", "余烬", "迅速结束"),
+    }
+
+    role_scores = {
+        "setup": 0.1,
+        "tension": 0.12,
+        "clash": 0.2,
+        "pursuit": 0.06,
+        "aftermath": 0.05,
+    }
+    matched_keywords: list[str] = []
+    for role, keywords in role_keywords.items():
+        hits = 0
+        for keyword in keywords:
+            count = combined_text.count(keyword)
+            if count > 0:
+                hits += count
+                matched_keywords.append(keyword)
+        role_scores[role] += min(hits, 4) * 0.14
+
+    if ocr_text:
+        role_scores["setup"] += 0.16
+        role_scores["tension"] += 0.12
+    priority_hits: dict[str, int] = {}
+    for role, phrases in role_priority_phrases.items():
+        hits = sum(combined_text.count(phrase) for phrase in phrases)
+        priority_hits[role] = hits
+        if hits <= 0:
+            continue
+        if role == "setup":
+            role_scores[role] += 0.34 * hits
+            role_scores["clash"] -= 0.04 * hits
+        elif role == "tension":
+            role_scores[role] += 0.28 * hits
+            role_scores["clash"] -= 0.02 * hits
+        elif role == "pursuit":
+            role_scores[role] += 0.32 * hits
+        elif role == "aftermath":
+            role_scores[role] += 0.3 * hits
+    if "中间" in summary and ("高潮" in summary or "激烈" in summary):
+        role_scores["clash"] += 0.16
+        role_scores["pursuit"] += 0.06
+    if "最后" in summary and any(token in summary for token in ("收尾", "结束", "烟雾", "废墟")):
+        role_scores["aftermath"] += 0.2
+    if "从第二帧开始" in summary or "真正的打斗从" in summary:
+        role_scores["setup"] += 0.12
+        role_scores["clash"] += 0.08
+    if duration >= 8.0:
+        role_scores["tension"] += 0.05
+        role_scores["pursuit"] += 0.05
+    if duration <= 4.5:
+        role_scores["clash"] += 0.08
+
+    role_scores["clash"] += motion_level * 0.28
+    role_scores["pursuit"] += motion_level * 0.12
+    role_scores["tension"] += motion_level * 0.05
+
+    max_role_score = max(max(role_scores.values()), 1e-6)
+    normalized_scores = {
+        role: round(min(score / max_role_score, 1.0), 4)
+        for role, score in role_scores.items()
+    }
+    ranked_roles = sorted(
+        normalized_scores.items(),
+        key=lambda item: (item[1], item[0]),
+        reverse=True,
+    )
+    primary_role = ranked_roles[0][0]
+    clash_score = float(normalized_scores.get("clash", 0.0))
+    for role in ("setup", "tension", "pursuit", "aftermath"):
+        role_score = float(normalized_scores.get(role, 0.0))
+        hits = int(priority_hits.get(role, 0))
+        if hits >= 1 and role_score >= clash_score * 0.72:
+            primary_role = role
+            break
+    secondary_roles = [
+        role
+        for role, score in ranked_roles[1:]
+        if role != primary_role and score >= max(normalized_scores[primary_role] - 0.18, 0.52)
+    ][:2]
+    role_order = {"setup": 0, "tension": 1, "clash": 2, "pursuit": 3, "aftermath": 4}
+    weighted_order = sum(
+        role_order[role] * float(score)
+        for role, score in normalized_scores.items()
+    )
+    total_weight = max(sum(float(score) for score in normalized_scores.values()), 1e-6)
+    narrative_progress = weighted_order / (4.0 * total_weight)
+    narrative_intensity = min(
+        (
+            (normalized_scores["clash"] * 0.56)
+            + (normalized_scores["pursuit"] * 0.2)
+            + (normalized_scores["tension"] * 0.12)
+            + (normalized_scores["aftermath"] * 0.04)
+            + (motion_level * 0.08)
+        ),
+        1.0,
+    )
+
+    return {
+        "primary_role": primary_role,
+        "secondary_roles": secondary_roles,
+        "role_scores": normalized_scores,
+        "narrative_progress": round(narrative_progress, 4),
+        "narrative_intensity": round(narrative_intensity, 4),
+        "dialogue_driven": bool(ocr_text),
+        "matched_keywords": sorted(set(matched_keywords))[:8],
+    }
+
+
 def _content_blocked_review(
     segment: dict,
     config: PipelineConfig,
@@ -508,6 +640,8 @@ def _build_reviewed_segment(
     payload["key_event_times"] = []
     payload["mean_motion"] = round(max(float(segment.get("mean_motion", 0.0)), float(review["confidence"])), 6)
     payload["peak_motion"] = round(max(float(segment.get("peak_motion", 0.0)), float(review["confidence"])), 6)
+    story_profile = _infer_story_profile(payload, review)
+    payload["story"] = story_profile
     payload["review"] = {
         "accepted": accepted,
         "accepted_by_relaxation": False,
@@ -522,6 +656,7 @@ def _build_reviewed_segment(
         "ai_key_event_times": [],
         "key_event_times": [],
         "frame_paths": [str(path.relative_to(project_root)) for path in frame_paths],
+        "story": story_profile,
     }
 
     base_score = max(float(segment["score"]), 0.01)

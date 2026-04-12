@@ -180,6 +180,331 @@ def _target_intensity(
     return max(0.0, min(1.0, intensity))
 
 
+def _segment_story_payload(segment: dict) -> dict:
+    review = segment.get("review") or {}
+    return dict(segment.get("story") or review.get("story") or {})
+
+
+def _segment_story_role_scores(segment: dict) -> dict[str, float]:
+    payload = _segment_story_payload(segment)
+    raw_scores = payload.get("role_scores") or {}
+    roles = ("setup", "tension", "clash", "pursuit", "aftermath")
+    if raw_scores:
+        return {
+            role: float(raw_scores.get(role, 0.0))
+            for role in roles
+        }
+
+    fallback_scores = {role: 0.0 for role in roles}
+    duration = max(float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)), 0.01)
+    motion_level = max(
+        float(segment.get("fight_probability", 0.0)),
+        float(segment.get("peak_motion", 0.0)),
+        float(segment.get("mean_motion", 0.0)),
+    )
+    fallback_scores["clash"] = min(0.45 + (motion_level * 0.4), 1.0)
+    fallback_scores["tension"] = 0.28 if duration >= 6.0 else 0.14
+    fallback_scores["pursuit"] = 0.16 if duration >= 8.0 else 0.06
+    fallback_scores["setup"] = 0.18 if duration >= 9.5 else 0.08
+    fallback_scores["aftermath"] = 0.12 if duration >= 7.5 else 0.04
+    return fallback_scores
+
+
+def _segment_story_role(segment: dict) -> str:
+    payload = _segment_story_payload(segment)
+    primary_role = str(payload.get("primary_role", "")).strip()
+    if primary_role:
+        return primary_role
+    scores = _segment_story_role_scores(segment)
+    return max(scores.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _segment_story_progress(segment: dict) -> float:
+    payload = _segment_story_payload(segment)
+    if "narrative_progress" in payload:
+        return max(0.0, min(float(payload["narrative_progress"]), 1.0))
+
+    role_order = {"setup": 0, "tension": 1, "clash": 2, "pursuit": 3, "aftermath": 4}
+    scores = _segment_story_role_scores(segment)
+    weight_total = max(sum(scores.values()), 1e-6)
+    weighted = sum(role_order[role] * score for role, score in scores.items())
+    return max(0.0, min(weighted / (4.0 * weight_total), 1.0))
+
+
+def _segment_story_intensity(segment: dict) -> float:
+    payload = _segment_story_payload(segment)
+    if "narrative_intensity" in payload:
+        return max(0.0, min(float(payload["narrative_intensity"]), 1.0))
+
+    scores = _segment_story_role_scores(segment)
+    motion_level = max(
+        float(segment.get("fight_probability", 0.0)),
+        float(segment.get("peak_motion", 0.0)),
+        float(segment.get("mean_motion", 0.0)),
+    )
+    return max(
+        0.0,
+        min(
+            (
+                (scores["clash"] * 0.56)
+                + (scores["pursuit"] * 0.2)
+                + (scores["tension"] * 0.12)
+                + (scores["aftermath"] * 0.04)
+                + (motion_level * 0.08)
+            ),
+            1.0,
+        ),
+    )
+
+
+def _weighted_music_density(center_time: float, beat_points: list[dict], beat_scores: list[float]) -> float:
+    if not beat_points:
+        return 0.0
+
+    density = 0.0
+    for beat, normalized_score in zip(beat_points, beat_scores):
+        distance = abs(center_time - float(beat["time"]))
+        if distance > 4.2:
+            continue
+        closeness = max(0.0, 1.0 - (distance / 4.2))
+        density += closeness * max(0.25, normalized_score)
+    return density
+
+
+def _section_role_targets(
+    section: str,
+    progress: float,
+    target_intensity: float,
+    beat_density: float,
+    peak_pressure: float,
+) -> dict[str, float]:
+    roles = {
+        "setup": 0.0,
+        "tension": 0.0,
+        "clash": 0.0,
+        "pursuit": 0.0,
+        "aftermath": 0.0,
+    }
+    if section == "intro":
+        roles.update({"setup": 1.0, "tension": 0.72, "clash": 0.18})
+    elif section == "build":
+        roles.update({"tension": 1.0, "setup": 0.46, "clash": 0.48, "pursuit": 0.18})
+    elif section == "drive":
+        roles.update({"clash": 1.0, "pursuit": 0.74, "tension": 0.34})
+    elif section == "climax":
+        roles.update({"clash": 1.0, "pursuit": 0.84, "aftermath": 0.32, "tension": 0.18})
+    else:
+        roles.update({"aftermath": 1.0, "clash": 0.36, "tension": 0.24, "setup": 0.12})
+
+    if target_intensity <= 0.34:
+        roles["setup"] += 0.18
+        if progress >= 0.82:
+            roles["aftermath"] += 0.14
+    if target_intensity >= 0.66:
+        roles["clash"] += 0.2
+        roles["pursuit"] += 0.12
+    if beat_density >= 0.58:
+        roles["pursuit"] += 0.1
+        roles["clash"] += 0.08
+    if peak_pressure >= 0.72:
+        roles["clash"] += 0.12
+        if progress >= 0.72:
+            roles["aftermath"] += 0.08
+    if progress >= 0.9:
+        roles["aftermath"] += 0.2
+
+    max_weight = max(max(roles.values()), 1e-6)
+    return {
+        role: round(min(weight / max_weight, 1.0), 4)
+        for role, weight in roles.items()
+    }
+
+
+def _classify_music_section(
+    progress: float,
+    target_intensity: float,
+    beat_density: float,
+    peak_pressure: float,
+) -> str:
+    if progress >= 0.9 and target_intensity <= 0.58:
+        return "resolve"
+    if peak_pressure >= 0.78 and progress >= 0.62:
+        return "climax"
+    if progress <= 0.12 and target_intensity <= 0.44:
+        return "intro"
+    if target_intensity >= 0.64 or beat_density >= 0.62:
+        return "drive" if progress < 0.78 else "climax"
+    if progress <= 0.38:
+        return "build"
+    if progress >= 0.84 and target_intensity <= 0.62:
+        return "resolve"
+    return "build" if target_intensity <= 0.48 else "drive"
+
+
+def _build_music_story_targets(
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    beat_points: list[dict],
+    timeline_chunks: list[dict],
+) -> list[dict]:
+    if not timeline_chunks:
+        return []
+
+    normalized_highlights = _normalized_highlight_scores(selected_highlights)
+    highlight_pairs = list(zip(selected_highlights, normalized_highlights))
+    beat_scores_raw = [float(item.get("score", 0.0)) for item in beat_points]
+    if beat_scores_raw:
+        beat_min = min(beat_scores_raw)
+        beat_spread = max(max(beat_scores_raw) - beat_min, 1e-8)
+        beat_scores = [(score - beat_min) / beat_spread for score in beat_scores_raw]
+    else:
+        beat_scores = []
+
+    raw_densities: list[float] = []
+    peak_pressures: list[float] = []
+    for chunk in timeline_chunks:
+        center_time = (float(chunk["start"]) + float(chunk["end"])) * 0.5
+        raw_densities.append(_weighted_music_density(center_time, beat_points, beat_scores))
+        peak_window = max(min((audio_end - audio_start) * 0.1, 8.0), 3.5)
+        peak_pressure = 0.0
+        for highlight, score_weight in highlight_pairs:
+            distance = abs(center_time - float(highlight["time"]))
+            closeness = max(0.0, 1.0 - (distance / peak_window))
+            peak_pressure = max(peak_pressure, closeness * (0.45 + (score_weight * 0.55)))
+        peak_pressures.append(peak_pressure)
+
+    density_min = min(raw_densities) if raw_densities else 0.0
+    density_spread = max((max(raw_densities) - density_min) if raw_densities else 0.0, 1e-8)
+    role_order = {"setup": 0, "tension": 1, "clash": 2, "pursuit": 3, "aftermath": 4}
+
+    story_targets: list[dict] = []
+    total_duration = max(audio_end - audio_start, 1e-6)
+    for chunk, raw_density, peak_pressure in zip(timeline_chunks, raw_densities, peak_pressures):
+        center_time = (float(chunk["start"]) + float(chunk["end"])) * 0.5
+        progress = (center_time - audio_start) / total_duration
+        target_intensity = float(chunk["target_intensity"])
+        beat_density = (raw_density - density_min) / density_spread if raw_densities else 0.0
+        section = _classify_music_section(progress, target_intensity, beat_density, peak_pressure)
+        role_targets = _section_role_targets(section, progress, target_intensity, beat_density, peak_pressure)
+        weight_total = max(sum(role_targets.values()), 1e-6)
+        story_progress = sum(
+            role_order[role] * float(weight)
+            for role, weight in role_targets.items()
+        ) / (4.0 * weight_total)
+        primary_roles = [
+            role
+            for role, weight in sorted(role_targets.items(), key=lambda item: (item[1], item[0]), reverse=True)
+            if weight >= 0.55
+        ][:3]
+        pace = "tight" if target_intensity >= 0.68 or beat_density >= 0.62 else "measured"
+        if section == "resolve":
+            pace = "release"
+        story_targets.append(
+            {
+                "start": round(float(chunk["start"]), 3),
+                "end": round(float(chunk["end"]), 3),
+                "section": section,
+                "pace": pace,
+                "music_progress": round(progress, 4),
+                "target_story_progress": round(story_progress, 4),
+                "target_story_intensity": round(max(target_intensity, peak_pressure * 0.8), 4),
+                "beat_density": round(beat_density, 4),
+                "peak_pressure": round(peak_pressure, 4),
+                "desired_roles": role_targets,
+                "primary_roles": primary_roles,
+            }
+        )
+    return story_targets
+
+
+def _merge_music_story_arc(story_targets: list[dict]) -> list[dict]:
+    if not story_targets:
+        return []
+
+    merged: list[dict] = []
+    for target in story_targets:
+        if (
+            merged
+            and merged[-1]["section"] == target["section"]
+            and merged[-1]["pace"] == target["pace"]
+            and merged[-1]["primary_roles"] == target["primary_roles"]
+        ):
+            merged[-1]["end"] = target["end"]
+            merged[-1]["target_story_intensity"] = round(
+                max(float(merged[-1]["target_story_intensity"]), float(target["target_story_intensity"])),
+                4,
+            )
+            merged[-1]["beat_density"] = round(
+                max(float(merged[-1]["beat_density"]), float(target["beat_density"])),
+                4,
+            )
+            merged[-1]["peak_pressure"] = round(
+                max(float(merged[-1]["peak_pressure"]), float(target["peak_pressure"])),
+                4,
+            )
+            continue
+        merged.append(dict(target))
+    return merged
+
+
+def _story_match_components(
+    segment: dict,
+    story_target: dict | None,
+    previous_segment: dict | None,
+    config: MatchConfig,
+) -> tuple[float, float, float, float]:
+    if not story_target:
+        return 0.0, 0.0, 0.0, 0.0
+
+    segment_scores = _segment_story_role_scores(segment)
+    desired_roles = {
+        role: float(weight)
+        for role, weight in (story_target.get("desired_roles") or {}).items()
+    }
+    desired_total = max(sum(desired_roles.values()), 1e-6)
+    role_match = sum(
+        desired_roles.get(role, 0.0) * segment_scores.get(role, 0.0)
+        for role in ("setup", "tension", "clash", "pursuit", "aftermath")
+    ) / desired_total
+
+    target_progress = float(story_target.get("target_story_progress", 0.5))
+    segment_progress = _segment_story_progress(segment)
+    progress_match = max(0.0, 1.0 - abs(segment_progress - target_progress))
+
+    target_story_intensity = float(story_target.get("target_story_intensity", 0.5))
+    segment_intensity = _segment_story_intensity(segment)
+    intensity_match = max(0.0, 1.0 - abs(segment_intensity - target_story_intensity))
+    segment_primary_role = _segment_story_role(segment)
+    primary_roles = [str(role) for role in (story_target.get("primary_roles") or [])]
+    primary_role_bonus = 0.0
+    primary_role_penalty = 0.0
+    if segment_primary_role in primary_roles:
+        primary_role_bonus = 0.055
+    elif primary_roles and story_target.get("section") in {"intro", "resolve"}:
+        primary_role_penalty = 0.03
+
+    transition_bonus = 0.0
+    backtrack_penalty = 0.0
+    if previous_segment is not None:
+        previous_progress = _segment_story_progress(previous_segment)
+        progress_delta = segment_progress - previous_progress
+        target_delta = target_progress - previous_progress
+        if progress_delta >= -0.03 and target_delta >= -0.03:
+            transition_bonus = config.story_transition_weight * min(progress_delta + 0.06, 0.18) / 0.18
+        elif progress_delta < -0.05 and target_progress >= previous_progress:
+            backtrack_penalty = config.story_backtrack_penalty * min(abs(progress_delta) / 0.4, 1.0)
+
+    story_fit = (
+        (role_match * config.story_role_weight)
+        + (progress_match * config.story_progress_weight)
+        + (intensity_match * (config.story_progress_weight * 0.6))
+        + primary_role_bonus
+        - primary_role_penalty
+    )
+    return story_fit, role_match, transition_bonus, backtrack_penalty
+
+
 def _segment_reuse_key(segment: dict) -> tuple[str, str, float, float]:
     return (
         str(segment["source_path"]),
@@ -1257,6 +1582,7 @@ def assign_clips(
     calm_segments: list[dict],
     timeline_chunks: list[dict],
     config: MatchConfig,
+    music_story_targets: list[dict] | None = None,
 ) -> list[MatchedClipRecord]:
     def _fight_probability_value(segment: dict) -> float:
         return float(segment.get("fight_probability", segment.get("confidence", segment.get("score", 0.0))))
@@ -1310,6 +1636,7 @@ def assign_clips(
         *,
         duration: float,
         target_intensity: float,
+        story_target: dict | None,
         scoring_chunk: dict,
         chunk_target_times: list[float],
         requires_event_match: bool,
@@ -1424,6 +1751,12 @@ def assign_clips(
                     (alignment_error - alignment_soft_limit) / (alignment_hard_limit - alignment_soft_limit),
                     1.0,
                 )
+            story_fit, story_role_match, story_transition_bonus, story_backtrack_penalty = _story_match_components(
+                segment,
+                story_target,
+                previous_segment,
+                config,
+            )
             weighted_score = (
                 (intensity_match * 0.34)
                 + (normalized_segment_score * segment_score_weight)
@@ -1432,9 +1765,11 @@ def assign_clips(
                 + pool_bias
                 + event_bonus
                 + sequence_bonus
+                + story_fit
             ) / reuse_penalty
+            weighted_score += story_transition_bonus
             weighted_score += (continuity_bonus * config.source_timeline_order_weight)
-            weighted_score -= timeline_order_penalty + alignment_penalty
+            weighted_score -= timeline_order_penalty + alignment_penalty + story_backtrack_penalty
 
             candidate_payload = {
                 "pool_name": pool_name,
@@ -1442,6 +1777,8 @@ def assign_clips(
                 "segment": segment,
                 "plan": candidate_plan,
                 "score": weighted_score,
+                "story_fit_score": story_fit + story_transition_bonus - story_backtrack_penalty,
+                "story_role_match": story_role_match,
             }
             fallback_candidate_key = (
                 1 if (not requires_event_match or alignment_error <= alignment_hard_limit) else 0,
@@ -1464,6 +1801,7 @@ def assign_clips(
         chunk_index = order - 1
         duration = float(chunk["duration"])
         target_intensity = float(chunk["target_intensity"])
+        story_target = music_story_targets[chunk_index] if music_story_targets and chunk_index < len(music_story_targets) else None
         chunk_target_times = _chunk_target_times(timeline_chunks, chunk_index)
         scoring_chunk = _resolve_chunk_alignment_target(chunk, chunk_target_times)
         requires_event_match = bool(chunk_target_times) or scoring_chunk.get("sync_target_time") is not None
@@ -1486,6 +1824,7 @@ def assign_clips(
             fight_candidates,
             duration=duration,
             target_intensity=target_intensity,
+            story_target=story_target,
             scoring_chunk=scoring_chunk,
             chunk_target_times=chunk_target_times,
             requires_event_match=requires_event_match,
@@ -1505,6 +1844,7 @@ def assign_clips(
                 calm_candidates,
                 duration=duration,
                 target_intensity=target_intensity,
+                story_target=story_target,
                 scoring_chunk=scoring_chunk,
                 chunk_target_times=chunk_target_times,
                 requires_event_match=requires_event_match,
@@ -1527,6 +1867,7 @@ def assign_clips(
                 fallback_candidates,
                 duration=duration,
                 target_intensity=target_intensity,
+                story_target=story_target,
                 scoring_chunk=scoring_chunk,
                 chunk_target_times=chunk_target_times,
                 requires_event_match=requires_event_match,
@@ -1577,6 +1918,9 @@ def assign_clips(
                 sequence_interval_error=sequence_interval_error,
                 matched_source_event_times=matched_source_event_times,
                 matched_target_times=matched_target_times,
+                segment_story_role=_segment_story_role(selected_segment),
+                music_story_section=str(story_target.get("section")) if story_target and story_target.get("section") else None,
+                story_fit_score=round(float(selected_candidate.get("story_fit_score", 0.0)), 4),
             )
         )
         if _extends_local_continuity_run(
@@ -1620,14 +1964,35 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
         return None
 
     calm_segments = track.get("calm_segments_override") or []
-    clips = assign_clips(fight_segments, calm_segments, timeline_chunks, config)
+    music_story_targets = _build_music_story_targets(
+        audio_start,
+        audio_end,
+        selected_highlights,
+        selected_beats,
+        timeline_chunks,
+    )
+    clips = assign_clips(
+        fight_segments,
+        calm_segments,
+        timeline_chunks,
+        config,
+        music_story_targets=music_story_targets,
+    )
     highlight_records = [MusicHighlightRecord(**highlight) for highlight in selected_highlights]
     beat_records = [MusicHighlightRecord(**beat) for beat in selected_beats]
+    music_story_arc = _merge_music_story_arc(music_story_targets)
 
     average_segment_score = sum(clip.segment_score for clip in clips) / max(len(clips), 1)
     average_highlight_score = sum(highlight.score for highlight in highlight_records) / max(len(highlight_records), 1)
+    average_story_fit = sum(float(clip.story_fit_score or 0.0) for clip in clips) / max(len(clips), 1)
     output_duration = round(sum(timeline_durations), 3)
-    plan_score = round((average_segment_score * 100.0) + average_highlight_score + (len(clips) * 0.15), 6)
+    plan_score = round(
+        (average_segment_score * 100.0)
+        + average_highlight_score
+        + (len(clips) * 0.15)
+        + (average_story_fit * 8.0),
+        6,
+    )
 
     return MatchPlanRecord(
         music_path=track["music_path"],
@@ -1639,6 +2004,7 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
         clips=clips,
         plan_score=plan_score,
         selected_beats=beat_records,
+        music_story_arc=music_story_arc,
     )
 
 
