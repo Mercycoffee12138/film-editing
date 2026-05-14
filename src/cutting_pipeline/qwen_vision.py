@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import mimetypes
 import os
@@ -202,6 +203,13 @@ def analyze_images(
             last_error = RuntimeError(
                 f"Qwen vision request failed with HTTP {exc.code} "
                 f"(attempt {attempt}/{config.max_retries}): {details}"
+            )
+        except http.client.RemoteDisconnected as exc:
+            if attempt >= config.max_retries:
+                raise RuntimeError(f"Qwen vision request failed: {exc}") from exc
+            last_error = RuntimeError(
+                f"Qwen vision request failed: {exc} "
+                f"(attempt {attempt}/{config.max_retries})"
             )
         except error.URLError as exc:
             if not _is_retryable_url_reason(exc.reason) or attempt >= config.max_retries:

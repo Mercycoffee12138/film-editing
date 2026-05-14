@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional output folder label under build/. Defaults to a label derived from selected videos.",
     )
+    parser.add_argument(
+        "--style",
+        default="fight",
+        choices=("fight", "warm"),
+        help="Editorial style preset. Use 'warm' to favor calm segments, longer shots, and softer pacing.",
+    )
     return parser.parse_args()
 
 
@@ -42,4 +48,5 @@ if __name__ == "__main__":
         start_stage=args.start_stage,
         selected_video_filenames=selected_videos,
         analysis_label=args.analysis_label.strip() or None,
+        editorial_style=args.style,
     )

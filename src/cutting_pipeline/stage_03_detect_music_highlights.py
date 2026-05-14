@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -22,8 +23,305 @@ from .progress import StageReporter
 from .qwen_vision import analyze_images, load_config_from_env
 
 
+_MANUAL_ANNOTATION_JSON = "highlight_beat_annotations.json"
+_MANUAL_ANNOTATION_CSV = "highlight_beat_annotations.csv"
+_AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+
+
 def _relative(path: Path, project_root: Path) -> str:
     return str(path.relative_to(project_root))
+
+
+def _is_supported_audio_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in _AUDIO_SUFFIXES
+
+
+def _to_seconds(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (int, float)):
+        seconds = float(raw_value)
+        return seconds if seconds >= 0.0 else None
+
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0.0 else None
+    except ValueError:
+        pass
+
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        numbers = [float(part.strip()) for part in parts]
+    except ValueError:
+        return None
+
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        hours = 0.0
+    else:
+        hours, minutes, seconds = numbers
+
+    if hours < 0.0 or minutes < 0.0 or seconds < 0.0:
+        return None
+    total = (hours * 3600.0) + (minutes * 60.0) + seconds
+    return round(total, 6)
+
+
+def _to_float(raw_value: Any, fallback: float) -> float:
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _to_bool(raw_value: Any, fallback: bool = True) -> bool:
+    if raw_value is None:
+        return fallback
+    value = str(raw_value).strip().lower()
+    if not value:
+        return fallback
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    return fallback
+
+
+def _normalize_range(start_seconds: float, end_seconds: float, duration: float) -> tuple[float, float]:
+    start = max(0.0, min(float(start_seconds), max(duration, 0.0)))
+    end = max(0.0, min(float(end_seconds), max(duration, 0.0)))
+    if start <= end:
+        return (round(start, 3), round(end, 3))
+    return (round(end, 3), round(start, 3))
+
+
+def _append_manual_range_entry(
+    target: list[tuple[float, float]],
+    entry: Any,
+    duration: float,
+) -> None:
+    if isinstance(entry, (int, float, str)):
+        time_seconds = _to_seconds(entry)
+        if time_seconds is not None:
+            target.append(_normalize_range(time_seconds, time_seconds, duration))
+        return
+    if not isinstance(entry, dict):
+        return
+    if not _to_bool(entry.get("enabled"), True):
+        return
+
+    time_seconds = _to_seconds(entry.get("time"))
+    if time_seconds is not None:
+        target.append(_normalize_range(time_seconds, time_seconds, duration))
+        return
+
+    start_seconds = _to_seconds(entry.get("start"))
+    end_seconds = _to_seconds(entry.get("end"))
+    if start_seconds is None and end_seconds is None:
+        return
+    if start_seconds is None:
+        start_seconds = end_seconds
+    if end_seconds is None:
+        end_seconds = start_seconds
+    if start_seconds is None or end_seconds is None:
+        return
+    target.append(_normalize_range(start_seconds, end_seconds, duration))
+
+
+def _record_in_ranges(record: MusicHighlightRecord, ranges: list[tuple[float, float]]) -> bool:
+    moment = float(record.time)
+    return any(start <= moment <= end for start, end in ranges)
+
+
+def _apply_manual_masks_for_track(
+    track: MusicTrackRecord,
+    masks: dict[str, list[tuple[float, float]]],
+) -> MusicTrackRecord:
+    highlight_ranges = masks.get("highlight_ranges") or []
+    beat_ranges = masks.get("beat_ranges") or []
+    if not highlight_ranges and not beat_ranges:
+        return track
+
+    highlights = list(track.highlights)
+    beats = list(track.beats)
+    if highlight_ranges:
+        highlights = [item for item in highlights if _record_in_ranges(item, highlight_ranges)]
+    if beat_ranges:
+        beats = [item for item in beats if _record_in_ranges(item, beat_ranges)]
+    return MusicTrackRecord(
+        music_path=track.music_path,
+        duration=track.duration,
+        highlights=highlights,
+        beats=beats,
+    )
+
+
+def _track_key_from_ref(raw_value: Any) -> str | None:
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    return Path(value).name
+
+
+def _ensure_manual_bucket(
+    buckets: dict[str, dict[str, list[tuple[float, float]]]],
+    track_key: str,
+) -> dict[str, list[tuple[float, float]]]:
+    if track_key not in buckets:
+        buckets[track_key] = {"highlight_ranges": [], "beat_ranges": []}
+    return buckets[track_key]
+
+
+def _load_manual_annotation_json(
+    path: Path,
+    track_durations: dict[str, float],
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    manual_by_track: dict[str, dict[str, list[tuple[float, float]]]] = {}
+
+    if isinstance(payload, dict) and isinstance(payload.get("tracks"), list):
+        track_entries = payload.get("tracks") or []
+    elif isinstance(payload, dict):
+        track_entries = []
+        for track_ref, entry in payload.items():
+            if track_ref in {"version", "meta"}:
+                continue
+            if isinstance(entry, dict):
+                candidate = dict(entry)
+                candidate.setdefault("music_filename", track_ref)
+                track_entries.append(candidate)
+    else:
+        return manual_by_track
+
+    for entry in track_entries:
+        if not isinstance(entry, dict):
+            continue
+        track_key = (
+            _track_key_from_ref(entry.get("music_filename"))
+            or _track_key_from_ref(entry.get("music_path"))
+            or _track_key_from_ref(entry.get("track"))
+        )
+        if track_key is None or track_key not in track_durations:
+            continue
+        bucket = _ensure_manual_bucket(manual_by_track, track_key)
+        duration = float(track_durations[track_key])
+        for highlight_entry in entry.get("highlights") or []:
+            _append_manual_range_entry(bucket["highlight_ranges"], highlight_entry, duration)
+        for beat_entry in entry.get("beats") or []:
+            _append_manual_range_entry(bucket["beat_ranges"], beat_entry, duration)
+
+    return manual_by_track
+
+
+def _load_manual_annotation_csv(
+    path: Path,
+    track_durations: dict[str, float],
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
+    manual_by_track: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = [line for line in handle.readlines() if not line.lstrip().startswith("#")]
+    if not rows:
+        return manual_by_track
+
+    reader = csv.DictReader(rows)
+    for row in reader:
+        if not row:
+            continue
+        if not _to_bool(row.get("enabled"), True):
+            continue
+        track_key = (
+            _track_key_from_ref(row.get("music_filename"))
+            or _track_key_from_ref(row.get("music_path"))
+        )
+        if track_key is None or track_key not in track_durations:
+            continue
+        event_type = str(row.get("type") or "").strip().lower()
+        duration = float(track_durations[track_key])
+        bucket = _ensure_manual_bucket(manual_by_track, track_key)
+
+        if event_type == "highlight":
+            entry = {
+                "enabled": row.get("enabled"),
+                "time": row.get("time"),
+                "start": row.get("start"),
+                "end": row.get("end"),
+            }
+            _append_manual_range_entry(bucket["highlight_ranges"], entry, duration)
+        elif event_type == "beat":
+            entry = {
+                "enabled": row.get("enabled"),
+                "time": row.get("time"),
+                "start": row.get("start"),
+                "end": row.get("end"),
+            }
+            _append_manual_range_entry(bucket["beat_ranges"], entry, duration)
+
+    return manual_by_track
+
+
+def _dedupe_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    deduped: dict[tuple[float, float], None] = {}
+    for interval in ranges:
+        deduped[(round(float(interval[0]), 3), round(float(interval[1]), 3))] = None
+    return sorted(deduped.keys(), key=lambda item: (item[0], item[1]))
+
+
+def _merge_manual_annotations(
+    left: dict[str, dict[str, list[tuple[float, float]]]],
+    right: dict[str, dict[str, list[tuple[float, float]]]],
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
+    merged = dict(left)
+    for track_key, payload in right.items():
+        bucket = _ensure_manual_bucket(merged, track_key)
+        bucket["highlight_ranges"].extend(payload.get("highlight_ranges") or [])
+        bucket["beat_ranges"].extend(payload.get("beat_ranges") or [])
+    return merged
+
+
+def _load_manual_annotations(
+    config: PipelineConfig,
+    music_files: list[Path],
+) -> tuple[dict[str, dict[str, list[tuple[float, float]]]], list[str]]:
+    track_durations = {
+        path.name: round(get_media_duration(path), 3)
+        for path in music_files
+    }
+    music_dir = config.paths.music_source_dir
+    json_path = music_dir / _MANUAL_ANNOTATION_JSON
+    csv_path = music_dir / _MANUAL_ANNOTATION_CSV
+    sources: list[str] = []
+    manual_by_track: dict[str, dict[str, list[tuple[float, float]]]] = {}
+
+    if json_path.exists():
+        try:
+            loaded = _load_manual_annotation_json(json_path, track_durations)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            loaded = {}
+        manual_by_track = _merge_manual_annotations(manual_by_track, loaded)
+        if loaded:
+            sources.append(_relative(json_path, config.paths.project_root))
+
+    if csv_path.exists():
+        try:
+            loaded = _load_manual_annotation_csv(csv_path, track_durations)
+        except (OSError, csv.Error, TypeError, ValueError):
+            loaded = {}
+        manual_by_track = _merge_manual_annotations(manual_by_track, loaded)
+        if loaded:
+            sources.append(_relative(csv_path, config.paths.project_root))
+
+    for bucket in manual_by_track.values():
+        bucket["highlight_ranges"] = _dedupe_ranges(bucket.get("highlight_ranges") or [])
+        bucket["beat_ranges"] = _dedupe_ranges(bucket.get("beat_ranges") or [])
+
+    return manual_by_track, sources
 
 
 def _records_from_indices(
@@ -501,16 +799,22 @@ def _analyze_track(path: Path, config: PipelineConfig) -> MusicTrackRecord:
 
 
 def run(config: PipelineConfig, reporter: StageReporter) -> dict:
-    music_files = sorted(config.paths.music_source_dir.glob("*"))
+    music_files = [path for path in sorted(config.paths.music_source_dir.glob("*")) if _is_supported_audio_file(path)]
     requested_music = config.match.selected_music_filename
     if requested_music:
         music_files = [path for path in music_files if path.name == requested_music]
         if not music_files:
-            available = ", ".join(sorted(path.name for path in config.paths.music_source_dir.glob("*")))
+            available = ", ".join(sorted(path.name for path in config.paths.music_source_dir.glob("*") if _is_supported_audio_file(path)))
             raise ValueError(
                 f"Configured music file '{requested_music}' was not found. Available tracks: {available}"
             )
     reporter.start(f"Analyzing {len(music_files)} music tracks.")
+    manual_annotations, manual_sources = _load_manual_annotations(config, music_files)
+    if manual_sources:
+        reporter.update(
+            0.04,
+            f"Loaded manual highlight/beat annotations from: {', '.join(manual_sources)}.",
+        )
 
     tracks: list[MusicTrackRecord] = []
     for index, music_path in enumerate(music_files, start=1):
@@ -525,11 +829,15 @@ def run(config: PipelineConfig, reporter: StageReporter) -> dict:
             track = _apply_ai_music_review(track, music_path, config)
         except (RuntimeError, ValueError):
             pass
+        manual_for_track = manual_annotations.get(music_path.name)
+        if manual_for_track:
+            track = _apply_manual_masks_for_track(track, manual_for_track)
         tracks.append(track)
 
     payload = {
         "stage": "stage_03_detect_music_highlights",
         "tracks": [asdict(track) for track in tracks],
+        "manual_annotation_sources": manual_sources,
     }
     output_path = config.paths.build_dir / "stage_03_music_highlights.json"
     write_json(output_path, payload)

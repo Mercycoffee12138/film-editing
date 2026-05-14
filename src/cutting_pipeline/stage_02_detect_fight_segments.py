@@ -18,6 +18,7 @@ from .qwen_vision import (
     analyze_images,
     load_config_from_env,
 )
+from .segment_labels import build_label_analysis_prompt, parse_label_response
 
 
 def _emit_progress(
@@ -315,6 +316,93 @@ def _extract_coarse_frames(
         export_video_frame(trimmed_path, _safe_timestamp(timestamp, duration), frame_path)
         frame_paths.append(frame_path)
     return frame_paths
+
+
+def _extract_segment_keyframes(
+    config: PipelineConfig,
+    trimmed_path: Path,
+    duration: float,
+    segment_start: float,
+    segment_end: float,
+    video_index: int,
+    segment_index: int,
+    frames_per_segment: int = 3,
+) -> list[Path]:
+    """Extract key frames from a fight segment for labeling analysis."""
+    frame_dir = (
+        config.paths.stage_02_review_frames_dir
+        / "segment_analysis"
+        / f"video_{video_index:03d}"
+        / f"segment_{segment_index:03d}"
+    )
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    segment_duration = segment_end - segment_start
+    frame_paths: list[Path] = []
+    
+    # Extract frames at key points: start, middle sections, and end
+    frame_times = []
+    if frames_per_segment == 1:
+        frame_times = [segment_start + segment_duration * 0.5]
+    elif frames_per_segment == 2:
+        frame_times = [segment_start + segment_duration * 0.33, segment_start + segment_duration * 0.67]
+    else:
+        # For 3+ frames, distribute evenly across the segment
+        for i in range(frames_per_segment):
+            ratio = (i + 0.5) / frames_per_segment
+            frame_times.append(segment_start + segment_duration * ratio)
+
+    for frame_index, timestamp in enumerate(frame_times, start=1):
+        frame_path = frame_dir / f"frame_{frame_index:02d}.jpg"
+        export_video_frame(trimmed_path, _safe_timestamp(timestamp, duration), frame_path)
+        frame_paths.append(frame_path)
+    
+    return frame_paths
+
+
+def _analyze_segment_labels(
+    config: PipelineConfig,
+    trimmed_path: Path,
+    duration: float,
+    segment: FightSegmentRecord,
+    video_index: int,
+    segment_index: int,
+    vision_config: QwenVisionConfig,
+) -> dict[str, Any] | None:
+    """Analyze a single fight segment using AI to extract detailed labels."""
+    try:
+        # Extract key frames from the segment
+        frame_paths = _extract_segment_keyframes(
+            config,
+            trimmed_path,
+            duration,
+            segment.start,
+            segment.end,
+            video_index,
+            segment_index,
+            frames_per_segment=3,
+        )
+        
+        if not frame_paths:
+            return None
+        
+        # Prepare prompt for label analysis
+        prompt = build_label_analysis_prompt()
+        
+        # Analyze frames with AI
+        response = analyze_images(frame_paths, prompt, vision_config)
+        
+        # Parse the response to extract labels
+        labels = parse_label_response(response)
+        
+        if labels is None:
+            return None
+        
+        return labels.to_dict()
+    
+    except (QwenVisionContentBlockedError, Exception):
+        # If labeling fails, return None - segment can still be used without labels
+        return None
 
 
 def _merge_ai_windows(
@@ -748,7 +836,7 @@ def run(config: PipelineConfig, reporter: StageReporter, trim_manifest: dict) ->
         )
 
         hydrated_segments: list[FightSegmentRecord] = []
-        for segment in segments:
+        for segment_idx, segment in enumerate(segments, start=1):
             hydrated = FightSegmentRecord(
                 source_path=record["source_path"],
                 trimmed_path=record["trimmed_path"],
@@ -764,6 +852,40 @@ def run(config: PipelineConfig, reporter: StageReporter, trim_manifest: dict) ->
                 detection_source=segment.detection_source,
                 key_event_times=list(segment.key_event_times),
             )
+            
+            # Extract and analyze labels if AI is available
+            if vision_config:
+                try:
+                    labels = _analyze_segment_labels(
+                        config,
+                        trimmed_path,
+                        record["trimmed_duration"],
+                        hydrated,
+                        index,
+                        segment_idx,
+                        vision_config,
+                    )
+                    if labels:
+                        hydrated = FightSegmentRecord(
+                            source_path=hydrated.source_path,
+                            trimmed_path=hydrated.trimmed_path,
+                            video_duration=hydrated.video_duration,
+                            start=hydrated.start,
+                            end=hydrated.end,
+                            peak_time=hydrated.peak_time,
+                            mean_motion=hydrated.mean_motion,
+                            peak_motion=hydrated.peak_motion,
+                            score=hydrated.score,
+                            confidence=hydrated.confidence,
+                            fight_probability=hydrated.fight_probability,
+                            detection_source=hydrated.detection_source,
+                            key_event_times=hydrated.key_event_times,
+                            labels=labels,
+                        )
+                except Exception:
+                    # If labeling fails, continue without labels
+                    pass
+            
             hydrated_segments.append(hydrated)
             all_segments.append(hydrated)
 

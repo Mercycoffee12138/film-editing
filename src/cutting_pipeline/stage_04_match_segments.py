@@ -8,6 +8,7 @@ from .config import MatchConfig, PipelineConfig
 from .json_io import write_json
 from .models import MatchPlanRecord, MatchedClipRecord, MusicHighlightRecord
 from .progress import StageReporter
+from .segment_matching import calculate_label_match_score
 
 
 def select_highlight_cluster(
@@ -1594,7 +1595,7 @@ def assign_clips(
     )
     ranked_calm_segments = sorted(calm_segments, key=lambda item: item["score"], reverse=True)
     if not ranked_fight_segments and not ranked_calm_segments:
-        raise ValueError("No fight segments are available for clip assignment.")
+        raise ValueError("No candidate segments are available for clip assignment.")
 
     fight_scores = [float(segment["score"]) for segment in ranked_fight_segments] or [0.0]
     calm_scores = [float(segment["score"]) for segment in ranked_calm_segments] or [0.0]
@@ -1757,6 +1758,13 @@ def assign_clips(
                 previous_segment,
                 config,
             )
+            
+            # Calculate label match bonus (focuses on critical first 4 labels)
+            label_match_score = calculate_label_match_score(segment, story_target)
+            label_match_bonus = 0.0
+            if label_match_score > 0.5:  # Only apply bonus if labels match reasonably well
+                label_match_bonus = (label_match_score - 0.5) * 0.1  # Up to 0.05 bonus
+            
             weighted_score = (
                 (intensity_match * 0.34)
                 + (normalized_segment_score * segment_score_weight)
@@ -1770,6 +1778,7 @@ def assign_clips(
             weighted_score += story_transition_bonus
             weighted_score += (continuity_bonus * config.source_timeline_order_weight)
             weighted_score -= timeline_order_penalty + alignment_penalty + story_backtrack_penalty
+            weighted_score += label_match_bonus
 
             candidate_payload = {
                 "pool_name": pool_name,
@@ -1820,8 +1829,17 @@ def assign_clips(
             ("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)
         ]
 
+        remaining_calm_budget = max(0.0, max_calm_duration - assigned_calm_duration)
+        prefer_calm_first = (
+            bool(config.prefer_calm_candidates)
+            and bool(calm_candidates)
+            and not requires_event_match
+            and target_intensity <= calm_threshold
+            and duration <= remaining_calm_budget + 1e-6
+        )
+        primary_candidates = calm_candidates if prefer_calm_first else fight_candidates
         selected_candidate = _pick_best_candidate(
-            fight_candidates,
+            primary_candidates,
             duration=duration,
             target_intensity=target_intensity,
             story_target=story_target,
@@ -1832,9 +1850,9 @@ def assign_clips(
             previous_previous_clip=previous_previous_clip,
         )
 
-        remaining_calm_budget = max(0.0, max_calm_duration - assigned_calm_duration)
         allow_calm_override = (
             calm_candidates
+            and not prefer_calm_first
             and not requires_event_match
             and target_intensity <= calm_threshold
             and duration <= remaining_calm_budget + 1e-6
@@ -1862,7 +1880,9 @@ def assign_clips(
                         selected_candidate = calm_candidate
 
         if selected_candidate is None:
-            fallback_candidates = calm_candidates or fight_candidates
+            fallback_candidates = fight_candidates or calm_candidates
+            if prefer_calm_first:
+                fallback_candidates = calm_candidates or fight_candidates
             selected_candidate = _pick_best_candidate(
                 fallback_candidates,
                 duration=duration,
@@ -1876,7 +1896,7 @@ def assign_clips(
             )
 
         if selected_candidate is None:
-                raise ValueError(f"No candidate clips were available for chunk {order}.")
+            raise ValueError(f"No candidate clips were available for chunk {order}.")
 
         best_pool = str(selected_candidate["pool_name"])
         best_index = int(selected_candidate["index"])

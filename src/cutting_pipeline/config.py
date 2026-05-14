@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
+
+DEFAULT_EDITORIAL_STYLE = "fight"
+SUPPORTED_EDITORIAL_STYLES = ("fight", "warm")
 
 
 @dataclass(frozen=True)
 class TrimConfig:
-    head_trim_seconds: float = 3 * 60 * 60.0
+    head_trim_seconds: float = 0.0
     tail_trim_seconds: float = 0.0
-    max_source_end_seconds: float | None = None
+    max_source_end_seconds: float | None = 1 * 60 * 60.0 + 40 * 60.0
     minimum_remaining_seconds: float = 5.0
 
 
@@ -38,17 +41,17 @@ class AudioConfig:
     min_peak_distance_seconds: float = 2.2
     top_highlights: int = 24
     peak_threshold_quantile: float = 0.72
-    beat_min_distance_seconds: float = 0.34
-    beat_top_candidates: int = 140
-    beat_threshold_quantile: float = 0.7
-    beat_sparse_threshold_quantile: float = 0.9
-    beat_sparse_distance_scale: float = 1.55
+    beat_min_distance_seconds: float = 0.26
+    beat_top_candidates: int = 220
+    beat_threshold_quantile: float = 0.42
+    beat_sparse_threshold_quantile: float = 0.97
+    beat_sparse_distance_scale: float = 1.2
     beat_score_accent_weight: float = 0.86
     beat_score_energy_weight: float = 0.14
     beat_group_min_gap_seconds: float = 0.18
     beat_group_max_gap_seconds: float = 1.0
     beat_group_max_gap_delta_seconds: float = 0.24
-    beat_group_min_size: int = 2
+    beat_group_min_size: int = 1
     beat_ai_dense_rhythm_bias: bool = False
 
 
@@ -82,7 +85,7 @@ class FightAIConfig:
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "dimonds.mp3"
+    selected_music_filename: str | None = "005.mp3"
     use_full_track_duration: bool = True
     highlight_cluster_window_seconds: float = 56.0
     max_highlights_per_track: int = 16
@@ -96,6 +99,7 @@ class MatchConfig:
     calm_max_total_share: float = 0.37
     calm_replace_score_margin: float = 0.05
     calm_force_intensity_threshold: float = 0.24
+    prefer_calm_candidates: bool = False
     beat_cut_enabled: bool = True
     beat_cut_min_clip_seconds: float = 0.24
     beat_cut_max_clip_seconds: float = 1.35
@@ -151,6 +155,7 @@ class RenderConfig:
 class SourceConfig:
     selected_video_filenames: tuple[str, ...] | None = None
     analysis_label: str | None = None
+    editorial_style: str = DEFAULT_EDITORIAL_STYLE
 
 
 @dataclass(frozen=True)
@@ -212,19 +217,82 @@ def _derive_analysis_label(selected_video_filenames: tuple[str, ...] | None) -> 
     return _sanitize_analysis_label("__".join(stems))
 
 
+def _normalize_editorial_style(style: str | None) -> str:
+    normalized = str(style or DEFAULT_EDITORIAL_STYLE).strip().lower()
+    if normalized not in SUPPORTED_EDITORIAL_STYLES:
+        supported = ", ".join(SUPPORTED_EDITORIAL_STYLES)
+        raise ValueError(f"Unsupported editorial style '{style}'. Supported styles: {supported}")
+    return normalized
+
+
+def _style_build_label(analysis_label: str, editorial_style: str) -> str:
+    if editorial_style == DEFAULT_EDITORIAL_STYLE:
+        return analysis_label
+    return f"{analysis_label}__{editorial_style}"
+
+
+def _apply_editorial_style_presets(config: PipelineConfig) -> PipelineConfig:
+    editorial_style = config.source.editorial_style
+    if editorial_style == DEFAULT_EDITORIAL_STYLE:
+        return config
+
+    if editorial_style == "warm":
+        return replace(
+            config,
+            motion=replace(
+                config.motion,
+                smoothing_seconds=2.0,
+                calm_threshold_quantile=0.45,
+                calm_threshold_ceiling=0.04,
+                calm_min_segment_seconds=2.4,
+                calm_max_segment_seconds=7.5,
+                calm_merge_gap_seconds=1.6,
+            ),
+            review=replace(
+                config.review,
+                enabled=False,
+            ),
+            match=replace(
+                config.match,
+                min_clip_seconds=1.2,
+                max_clip_seconds=5.6,
+                calm_target_intensity_threshold=0.72,
+                calm_max_total_share=0.82,
+                calm_replace_score_margin=-0.08,
+                calm_force_intensity_threshold=0.58,
+                prefer_calm_candidates=True,
+                beat_cut_enabled=False,
+                source_reuse_penalty=0.18,
+                segment_reuse_penalty=0.8,
+                intro_padding_seconds=6.0,
+                outro_padding_seconds=8.0,
+            ),
+            render=replace(
+                config.render,
+                include_source_hit_audio=False,
+                music_volume=1.0,
+            ),
+        )
+
+    return config
+
+
 def build_default_config(
     project_root: Path,
     selected_video_filenames: tuple[str, ...] | None = None,
     analysis_label: str | None = None,
+    editorial_style: str = DEFAULT_EDITORIAL_STYLE,
 ) -> PipelineConfig:
+    normalized_style = _normalize_editorial_style(editorial_style)
     source_root = project_root / "source"
     source = SourceConfig(
         selected_video_filenames=selected_video_filenames,
         analysis_label=_sanitize_analysis_label(analysis_label)
         if analysis_label
         else _derive_analysis_label(selected_video_filenames),
+        editorial_style=normalized_style,
     )
-    build_dir = project_root / "build" / source.analysis_label
+    build_dir = project_root / "build" / _style_build_label(source.analysis_label, normalized_style)
 
     paths = PipelinePaths(
         project_root=project_root,
@@ -237,4 +305,4 @@ def build_default_config(
         stage_05_clip_dir=build_dir / "stage_05_render_clips",
         stage_05_temp_dir=build_dir / "stage_05_temp",
     )
-    return PipelineConfig(paths=paths, source=source)
+    return _apply_editorial_style_presets(PipelineConfig(paths=paths, source=source))

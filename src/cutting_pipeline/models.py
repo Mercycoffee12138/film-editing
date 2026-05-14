@@ -29,6 +29,7 @@ class FightSegmentRecord:
     fight_probability: float = 0.0
     detection_source: str = "unknown"
     key_event_times: list[float] = field(default_factory=list)
+    labels: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
